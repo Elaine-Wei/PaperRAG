@@ -1,0 +1,19 @@
+CREATE TABLE papers (
+    id                         SERIAL PRIMARY KEY,
+    arxiv_id                   TEXT UNIQUE NOT NULL,
+    title                      TEXT NOT NULL,
+    abstract                   TEXT,
+    authors                    TEXT[],
+    categories                 TEXT[],
+    published                  DATE,
+    pdf_url                    TEXT,
+    citation_count             INTEGER,
+    influential_citation_count INTEGER,
+    reference_count            INTEGER,
+    year                       INTEGER,
+    code_urls                  TEXT[],
+    hf_upvotes                 INTEGER,
+    enriched                   BOOLEAN DEFAULT FALSE,
+    enriched_at                TIMESTAMP,
+    created_at                 TIMESTAMP DEFAULT NOW()
+);
