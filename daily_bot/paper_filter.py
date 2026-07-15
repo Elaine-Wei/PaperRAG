@@ -1,9 +1,15 @@
 """
-paper_filter —— daily_bot 的论文筛选（版本 甲）
+paper_filter —— daily_bot 的论文筛选
 
-只用「已在内存里的信号」筛选：arXiv 分类、标题/摘要关键词、recency。
-不涉及 enrichment / HF upvotes / code links / OpenAlex / 数据库（留给后续版本）。
+版本 甲（本模块）：宽松的关键词/分类「粗召回网」，只用内存里的信号（arXiv 分类、
+标题/摘要关键词、recency）。现在偏召回、不偏精度 —— 目标是「别漏掉任何可能相关的」，
+接受噪声；真正的相关性判断交给 stage-B（乙，见 stage_b.py，用 LLM 读摘要分类）。
 
+- coarse_candidates()：粗召回，产出候选池（几十篇）交给 stage-B。
+- final_select_by_area()：stage-B 判定之后，按 LLM 赋予的 area 做最终精选（每方向 1-2 篇）。
+- select() / format_report()：旧的纯关键词精选，保留作为 stage-B 整体失败时的回退。
+
+不涉及 enrichment / HF upvotes / code links / OpenAlex / 数据库。
 想调整关注方向 / 抓取范围 / 选取上限，改本文件顶部的配置即可。
 """
 
@@ -22,48 +28,40 @@ BROAD_CATEGORIES = {"cs.LG", "cs.AI", "cs.CL"}
 # A 类关注方向（团队核心兴趣）。
 # 匹配规则（见 match_signals）：命中 = 专指分类命中 OR 关键词命中（标题+摘要，大小写不敏感）。
 #   - 专指分类（不在 BROAD_CATEGORIES 里的）单独命中即可。
-#   - 广义分类（cs.LG/cs.AI/cs.CL）单独不算；但关键词命中与分类无关，
-#     所以一篇发在 cs.LG 的 AI-for-quant / AI-for-math 仍能靠强关键词被捞到（保召回）。
-# 关键词力求“专指但不过窄”：宁可放进一点可肉眼剔除的噪声，也不要漏掉真正相关的论文。
+#   - 广义分类（cs.LG/cs.AI/cs.CL）单独不算；但关键词命中与分类无关。
+# 关键词现在故意放宽（偏召回）：宁可多进噪声，也别漏。误报由 stage-B（LLM 读摘要）剔除。
 FOCUS_AREAS = {
     "quant": {
-        # q-fin.* 都是专指分类，命中即算。关键词收紧了 factor/alpha/portfolio 这类泛词，
-        # 但保留足够强的量化词，让发在 cs.LG 的 AI-for-quant 也能被捞到。
         "categories": ["q-fin.TR", "q-fin.PM", "q-fin.CP", "q-fin.ST"],
-        "keywords": ["quantitative trading", "statistical arbitrage", "trading strategy",
-                     "market making", "backtest", "alpha factor", "factor model",
-                     "portfolio optimization", "portfolio management", "asset pricing",
-                     "order execution", "market impact", "volatility forecasting"],
+        "keywords": ["quantitative", "trading", "factor", "alpha", "portfolio",
+                     "market making", "backtest", "arbitrage", "asset pricing",
+                     "execution", "volatility", "hedging", "derivative", "option pricing",
+                     "investment", "stock", "financial", "market microstructure"],
     },
     "ai4math": {
-        # math.OC 专指（命中即算）；cs.LG/cs.AI 广义（需关键词）。关键词覆盖形式化/定理证明/
-        # 数学推理等真正的 AI-for-math 方向，保持对 cs.LG 论文的召回。
         "categories": ["math.OC", "cs.LG", "cs.AI"],
-        "keywords": ["AI for math", "theorem proving", "automated theorem proving",
-                     "formal proof", "proof assistant", "autoformalization",
-                     "symbolic reasoning", "mathematical reasoning", "math reasoning",
-                     "mathematical problem", "formal mathematics", "olympiad",
-                     "competition math"],
+        "keywords": ["theorem", "proof", "formal", "autoformalization", "symbolic",
+                     "mathematical reasoning", "math reasoning", "mathematical problem",
+                     "olympiad", "competition math", "lean", "geometry", "algebra",
+                     "formal verification", "proof assistant", "AI for math"],
     },
     "lob": {
         "categories": ["q-fin.TR"],
         "keywords": ["limit order book", "LOB", "matching engine", "order book",
-                     "microstructure", "market microstructure", "order flow"],
+                     "microstructure", "market microstructure", "order flow",
+                     "bid-ask", "market maker", "spread"],
     },
     "hpc": {
-        # cs.DC/cs.PF 专指，命中即算；关键词再补一些系统性能相关词。
         "categories": ["cs.DC", "cs.PF"],
         "keywords": ["high-frequency", "low-latency", "high-performance", "ZeroMQ",
-                     "DAG scheduling", "distributed training", "inference serving",
-                     "kernel optimization"],
+                     "distributed", "parallel", "GPU", "throughput", "latency",
+                     "scheduling", "kernel", "HPC", "inference serving", "scaling"],
     },
     "agent": {
-        # cs.MA 专指（多智能体系统），命中即算；cs.AI/cs.CL 广义需关键词。
-        # 关键词保持宽松，让真正的 agent/LLM 论文（多在 cs.AI/cs.CL）都能被捞到。
         "categories": ["cs.AI", "cs.CL", "cs.MA"],
         "keywords": ["agent", "multi-agent", "agentic", "LLM", "large language model",
                      "RAG", "retrieval-augmented", "tool use", "tool-calling",
-                     "function calling"],
+                     "function calling", "planning", "reasoning", "autonomous"],
     },
 }
 
@@ -72,9 +70,13 @@ A_CLASS_ORDER = ["quant", "ai4math", "lob", "hpc", "agent"]
 
 # 选取上限
 MAX_PER_AREA = 2      # 每个方向最多留几篇
-MAX_A_CLASS = 5       # A 类总上限
+MAX_A_CLASS = 5       # A 类总上限（select() 回退路径用）
 MAX_B_CLASS = 2       # B 类兜底最多几篇
 DAILY_TARGET_MAX = 6  # 每天总量大致上限（A + B）
+
+# 粗召回候选池上限：默认让 stage-B 看到（几乎）全部粗召回结果，只作为对付病态日
+# （比如某天几百篇）的安全上限，正常不会触发。触发时会打印，并优先保住专指分类命中。
+MAX_CANDIDATES = 200
 
 # 抓取范围（版本 甲 拓宽）：复用 crawler/config.py 里已有的 agent 查询，
 # 再补上 q-fin.* / cs.DC / cs.PF / math.OC，让 quant/lob/hpc/math 方向也有候选。
@@ -276,4 +278,118 @@ def format_report(report, fetched_count=None):
 
     lines.append(f"合计选中 {len(report['selected'])} 篇"
                  f"（A 类 {report['a_count']} + B 类 {len(report['b_fallback'])}）")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 甲（宽松粗召回）+ 乙（stage-B）流程用的函数
+# ---------------------------------------------------------------------------
+
+def _has_specific_cat(paper):
+    """该论文是否有「专指分类」命中（signal 以 cat 开头；广义分类不算专指）。"""
+    return any(sig.startswith("cat") for sig in (paper.get("area_signals") or {}).values())
+
+
+def coarse_candidates(papers, max_candidates=MAX_CANDIDATES):
+    """
+    甲：宽松粗召回。给每篇打上 loose area 标签，命中 ≥1 方向者进入候选池。
+    默认让 stage-B 看到（几乎）全部粗召回结果；只有超过安全上限 max_candidates 才截断。
+
+    截断顺序（保召回、护小众方向）：先保留全部「专指分类命中」（q-fin.*/math.OC/cs.MA/
+    cs.DC/cs.PF —— cat: 信号），再用「仅关键词命中」按 recency 填满剩余预算。
+    这样 ai4math/lob 这类小方向不会被 agent 洪流按 recency 挤掉。
+    返回候选列表（每篇已带 areas / area_signals），按 recency 新→旧。
+    """
+    for p in papers:
+        p["area_signals"] = match_signals(p)
+        p["areas"] = list(p["area_signals"].keys())
+
+    cands = [p for p in papers if p["areas"]]
+
+    if len(cands) <= max_candidates:
+        cands.sort(key=_recency_key, reverse=True)
+        return cands
+
+    # 触发安全上限：专指分类命中优先保留，其余按 recency 填充
+    cat_hits = sorted((p for p in cands if _has_specific_cat(p)),
+                      key=_recency_key, reverse=True)
+    kw_only = sorted((p for p in cands if not _has_specific_cat(p)),
+                     key=_recency_key, reverse=True)
+    kept_cat = cat_hits[:max_candidates]                      # 极端情况自身超限才按 recency 截
+    remaining = max(0, max_candidates - len(kept_cat))
+    kept_kw = kw_only[:remaining]
+    kept = kept_cat + kept_kw
+    dropped = len(cands) - len(kept)
+    print(f"[甲] 粗召回 {len(cands)} 篇 > 安全上限 {max_candidates}："
+          f"保留 专指分类命中 {len(kept_cat)} 篇 + 仅关键词命中(最新) {len(kept_kw)} 篇，"
+          f"丢弃 {dropped} 篇较旧的仅关键词命中（专指分类命中全部保留）")
+    kept.sort(key=_recency_key, reverse=True)
+    return kept
+
+
+def final_select_by_area(candidates, order=A_CLASS_ORDER,
+                         max_per_area=MAX_PER_AREA, max_total=DAILY_TARGET_MAX):
+    """
+    乙判定后的最终精选：按 stage-B 赋予的 stage_b_area 分组，round-robin + recency 选取，
+    每方向 ≤ max_per_area、总量 ≤ max_total。
+    若没有任何相关论文（全被判 not_relevant / uncertain），从候选池按最新兜底 1-2 篇，
+    保证 digest 不空。
+    返回 {"picked": {area:[...]}, "selected":[...], "fallback":[...], "relevant_count":int}
+    """
+    relevant = [p for p in candidates if p.get("stage_b_area") in FOCUS_AREAS]
+    by_area = {}
+    for a in order:
+        cand = [p for p in relevant if p.get("stage_b_area") == a]
+        cand.sort(key=_recency_key, reverse=True)
+        by_area[a] = cand
+
+    selected = []
+    picked = {a: [] for a in order}
+    ids = set()
+
+    def _take_one(a):
+        if len(selected) >= max_total or len(picked[a]) >= max_per_area:
+            return
+        for p in by_area[a]:
+            if p["arxiv_id"] not in ids:
+                ids.add(p["arxiv_id"])
+                selected.append(p)
+                picked[a].append(p)
+                return
+
+    for a in order:              # Round 1：每方向先各取 1 篇
+        _take_one(a)
+    for a in order:              # Round 2：还有名额再补第 2 篇
+        if len(selected) >= max_total:
+            break
+        _take_one(a)
+
+    fallback = []
+    if not selected:             # 今天没有任何相关论文 → 按最新兜底
+        for p in sorted(candidates, key=_recency_key, reverse=True):
+            if len(fallback) >= MAX_B_CLASS:
+                break
+            fallback.append(p)
+            selected.append(p)
+
+    return {"picked": picked, "selected": selected,
+            "fallback": fallback, "relevant_count": len(relevant)}
+
+
+def format_final_selection(result, order=A_CLASS_ORDER):
+    """把 final_select_by_area 的结果格式化成可读的最终选择报告。"""
+    lines = ["== 最终选择（stage-B 之后）/ Final selection =="]
+    for a in order:
+        picks = result["picked"].get(a, [])
+        if picks:
+            lines.append(f"  [{a}] 选中 {len(picks)} 篇：")
+            for p in picks:
+                lines.append(f"      · {p['arxiv_id']} ({p.get('published')}) — {p.get('title')}")
+        else:
+            lines.append(f"  [{a}] 无")
+    if result["fallback"]:
+        lines.append("  兜底（今日无相关论文，取最新）：")
+        for p in result["fallback"]:
+            lines.append(f"      · {p['arxiv_id']} ({p.get('published')}) — {p.get('title')}")
+    lines.append(f"相关论文 {result['relevant_count']} 篇，最终选中 {len(result['selected'])} 篇。")
     return "\n".join(lines)

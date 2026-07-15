@@ -63,9 +63,11 @@ def load_env_file(path=None):
 
 load_env_file()
 
-# 筛选模块（版本 甲）：关注方向配置、拓宽后的抓取查询、粗/细筛逻辑都在这里
+# 筛选模块：甲（关键词粗召回）、乙（stage-B AI 分类）、共享 relay 调用
 sys.path.insert(0, CRAWLER_DIR)  # 便于 paper_filter 复用 crawler/config.py
 import paper_filter
+import stage_b
+import relay
 
 # LLM relay（OpenAI 兼容）
 RELAY_API_KEY = os.environ.get("RELAY_API_KEY")
@@ -284,55 +286,14 @@ DIGEST_SYSTEM_PROMPT = (
 )
 
 
-def _extract_json(text):
-    """尽力从模型输出中解析 JSON：直接解析 → 截取首个 {...} 再解析。"""
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            pass
-    return None
-
-
 def call_relay(paper):
-    """调用 relay LLM，返回 message.content 字符串。失败抛异常给上层处理。"""
-    if not RELAY_API_KEY:
-        raise RuntimeError("环境变量 RELAY_API_KEY 未设置")
-
+    """调用 relay 生成导读，返回 (content, usage)。复用 relay.relay_chat，不再自造 HTTP。"""
     user_prompt = (
         f"论文标题：{paper['title']}\n\n"
         f"分类：{', '.join(paper.get('categories') or [])}\n\n"
         f"摘要：\n{paper['abstract']}"
     )
-    body = {
-        "model": RELAY_MODEL,
-        "messages": [
-            {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.3,
-    }
-    req = urllib.request.Request(
-        RELAY_BASE_URL.rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {RELAY_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        payload = json.loads(resp.read())
-    content = payload["choices"][0]["message"]["content"]
-    usage = payload.get("usage")  # OpenAI 格式：prompt_tokens/completion_tokens/total_tokens
-    return content, usage
+    return relay.relay_chat(DIGEST_SYSTEM_PROMPT, user_prompt, temperature=0.3)
 
 
 def generate_digest(paper):
@@ -353,7 +314,7 @@ def generate_digest(paper):
 
     try:
         content, usage = call_relay(paper)
-        parsed = _extract_json(content)
+        parsed = relay.extract_json(content)
         if not parsed:
             raise ValueError("模型输出无法解析为 JSON")
         if not isinstance(parsed.get("zh"), dict) or not isinstance(parsed.get("en"), dict):
@@ -606,21 +567,46 @@ def main():
         print("[ERROR] 没有抓到任何论文，退出。")
         return
 
-    print("== Step 3+4: 筛选（版本 甲）==")
-    report = paper_filter.select(papers)
-    print(paper_filter.format_report(report, fetched_count=len(papers)))
-    picked = report["selected"]
+    print("== Step 3: 甲（宽松粗召回）==")
+    candidates = paper_filter.coarse_candidates(papers)
+    print(f"[甲] 候选池 {len(candidates)} 篇交给 stage-B")
+    if not candidates:
+        print("[ERROR] 粗召回后没有候选，退出。")
+        return
+    # 候选池的 loose area 覆盖（一篇可带多个 tag）：确认小众方向也进了 stage-B
+    area_cover = {}
+    for p in candidates:
+        for a in p.get("areas") or []:
+            area_cover[a] = area_cover.get(a, 0) + 1
+    cover_str = ", ".join(f"{a}:{area_cover.get(a, 0)}" for a in paper_filter.A_CLASS_ORDER)
+    print(f"[甲] 候选池 loose 方向覆盖（可重叠）：{cover_str}")
+
+    print("\n== Step 4: 乙（stage-B / LLM 分类）==")
+    sb = stage_b.classify(candidates)
+    if not sb["verdicts"]:
+        # stage-B 整体失败（如无 key / relay 不可达）→ 回退到甲的关键词精选
+        print("[WARN] stage-B 未产出任何判定，回退到甲的关键词精选。")
+        report = paper_filter.select(papers)
+        print(paper_filter.format_report(report, fetched_count=len(papers)))
+        picked = report["selected"]
+    else:
+        print(stage_b.format_report(candidates, sb))
+        final = paper_filter.final_select_by_area(candidates)
+        print()
+        print(paper_filter.format_final_selection(final))
+        picked = final["selected"]
+
     if not picked:
         print("[ERROR] 筛选后没有任何论文可导读，退出。")
         return
 
     css = load_css()
 
-    print("== Step 5: 导读 + HTML ==")
+    print("\n== Step 5: 导读 + HTML ==")
     written = []
     for paper in picked:
-        tags = ",".join(paper.get("areas") or []) or "B(general)"
-        print(f"[paper] {paper['arxiv_id']} [{tags}] — {paper.get('title')}")
+        tag = paper.get("stage_b_area") or (",".join(paper.get("areas") or []) or "fallback")
+        print(f"[paper] {paper['arxiv_id']} [{tag}] — {paper.get('title')}")
         digest = generate_digest(paper)
 
         # 导读结果小结（成功 / 兜底、中英预览、token 用量）
