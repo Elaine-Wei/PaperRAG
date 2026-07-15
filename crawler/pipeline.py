@@ -6,7 +6,7 @@ from enrichers import enrich_paper
 from database import (
     get_connection,
     get_seen_ids,
-    get_unenriched,
+    get_pending_enrichment,
     insert_paper,
     update_enriched,
 )
@@ -30,12 +30,13 @@ def run_crawl(conn):
 
 def run_enrichment(conn):
     """对未增强的论文批量补充字段。返回处理的论文数。"""
-    arxiv_ids = get_unenriched(conn, ENRICHMENT_BATCH)
-    for arxiv_id in arxiv_ids:
-        data = enrich_paper(arxiv_id)
+    rows = get_pending_enrichment(conn, ENRICHMENT_BATCH)
+    for arxiv_id, title, enriched in rows:
+        # enriched=TRUE 说明已尝试过一次 → 这是 OpenAlex 重试，不再重复请求 HF
+        data = enrich_paper(arxiv_id, title, include_hf=not enriched)
         update_enriched(conn, arxiv_id, data)
         # 限速已由 enrich_paper 内部逐请求处理，这里不再额外 sleep
-    return len(arxiv_ids)
+    return len(rows)
 
 
 def main():

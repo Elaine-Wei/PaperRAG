@@ -40,18 +40,28 @@ def insert_paper(conn, paper):
     conn.commit()
 
 
-def get_unenriched(conn, limit):
-    """查 enriched=FALSE 的 arxiv_id 列表。"""
+def get_pending_enrichment(conn, limit):
+    """
+    待增强论文的 (arxiv_id, title, enriched) 列表。包含两类：
+      1. 从未尝试过的（enriched = FALSE）—— 首次增强，两个源都跑；
+      2. 已尝试过但仍缺 OpenAlex 数据、且发表在 7 天内的（enriched = TRUE
+         AND citation_count IS NULL AND published 在窗口内）—— 只重试 OpenAlex。
+    超过 7 天仍无 OpenAlex 数据的论文不再被选中（彻底放弃，不无限重试）。
+    citation_count IS NULL 表示 OpenAlex 什么都没给；真实的 0 视为已拿到数据、不再重试。
+    enriched 标志在此语义下 = “至少尝试过一次”，供上层决定是否还要跑 HF。
+    """
     sql = """
-        SELECT arxiv_id
+        SELECT arxiv_id, title, enriched
         FROM papers
         WHERE enriched = FALSE
-        ORDER BY created_at ASC
+           OR (citation_count IS NULL
+               AND published >= CURRENT_DATE - INTERVAL '7 days')
+        ORDER BY enriched ASC, created_at ASC
         LIMIT %s;
     """
     with conn.cursor() as cur:
         cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+        return [(row[0], row[1], row[2]) for row in cur.fetchall()]
 
 
 def update_enriched(conn, arxiv_id, data):
