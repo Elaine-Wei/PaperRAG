@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+
+<!-- Google Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Libre+Baskerville:ital,wght@0,700;1,400&family=Noto+Sans+SC:wght@400;700&family=Noto+Serif+SC:wght@700&family=Source+Sans+3:wght@400;700&display=swap" rel="stylesheet">
+
+<!-- KaTeX -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+        delimiters: [
+            {left: '$$', right: '$$', display: true},
+            {left: '$', right: '$', display: false}
+        ],
+        throwOnError: false
+    });"></script>
+
+<style>
+/* ← Paste the full CSS from references/full-css.css here */
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<!-- ============ HEADER ============ -->
+<header class="header">
+    <div class="header-meta">{{CATEGORY}} · {{TAG}}</div>
+    <h1>{{MAIN_TITLE}}</h1>
+    <p class="header-subtitle">
+        {{SUBTITLE_HOOK}}
+    </p>
+    <div class="paper-ref">
+        <span class="paper-title">{{PAPER_TITLE}}</span><br>
+        {{AUTHORS}} · {{VENUE}} · <a href="{{ARXIV_URL}}">arXiv:{{ARXIV_ID}}</a>
+    </div>
+</header>
+
+<!-- ============ TOC ============ -->
+<nav class="toc">
+    <div class="toc-label">目录</div>
+    <ol>
+        <li><a href="#s1">{{Section 1 Title}}</a></li>
+        <li><a href="#s2">{{Section 2 Title}}</a></li>
+        <!-- ... -->
+    </ol>
+</nav>
+
+<!-- ============ §1 ============ -->
+<section id="s1">
+<h2><span class="section-num">1</span>{{Section 1 Title}}</h2>
+
+<h3>{{Subsection}}</h3>
+
+<p>Body text with $inline\_math$ and <strong>bold emphasis</strong>.</p>
+
+$$display\_math\_equation$$
+
+<div class="box danger">
+    <div class="box-label">{{Label}}</div>
+    <p>Callout content...</p>
+</div>
+
+<div class="theorem-block">
+    <div class="theorem-label">THEOREM X.X (Name)</div>
+    <p>$theorem\_statement$</p>
+</div>
+
+<table>
+    <thead><tr><th>Col 1</th><th>Col 2</th></tr></thead>
+    <tbody><tr><td>Data</td><td>Data</td></tr></tbody>
+</table>
+
+<ol class="steps">
+    <li>Step description</li>
+    <li>Step description</li>
+</ol>
+
+</section>
+
+<!-- ============ SUMMARY ============ -->
+<div class="box success">
+    <div class="box-label">一句话总结</div>
+    <p><strong>Key takeaway bold sentence.</strong></p>
+</div>
+
+<!-- ============ FOOTER ============ -->
+<footer class="footer">
+    <p>原论文：<a href="{{URL}}">{{Paper Title}}</a> · {{Venue Year}}</p>
+    <p style="margin-top: 6px;">教学讲义 · {{Topic}}</p>
+</footer>
+
+</div>
+
+</body>
+</html>

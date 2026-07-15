@@ -19,3 +19,4 @@ seen_ids.json
 
 # 系统文件
 .DS_Store
+daily_bot/output/
