@@ -519,6 +519,50 @@ def score_authority(meta, fulltext, model=MAIN_MODEL):
 
 
 # ---------------------------------------------------------------------------
+# 综评 composite（读 5 个真实子分 → 0-10 综评分 + 中文理由；加法式，绝不改子分）
+# 结构对齐 score_main/cross_check/finalize，便于日后加 Claude→luna→Claude 复核。
+# ---------------------------------------------------------------------------
+
+COMPOSITE_SYS = (
+    "你在给一篇论文打一个【综评分】(0-10)，用来把当天一批论文排序、挑出最值得读的。\n"
+    "输入是这篇论文的 5 个【已定】子维度分（请勿改动、勿质疑它们，只做综合权衡）：\n"
+    "  新鲜度(0-5)、可复现性(0-5)、方法新颖度(0-5)、领域相关性(0-5，对我们关注方向的贴合度)、"
+    "权威性(0-5，机构/作者/发表；可能为 N/A)。\n"
+    "综合判断这篇对【我们（agent/quant/hpc/lob/ai4math 方向的量化研究者）】当天的阅读价值："
+    "领域相关性与新颖度通常更重要，可复现性/权威性为加分，新鲜度为次要；权威性 N/A 不扣分。\n"
+    "给一个 0-10 的 composite 分（可含一位小数）和一句【中文】综评理由（≤40字，兼作『入选理由』）。\n"
+    '只输出 JSON：{"composite":0,"reason":""}')
+
+
+def composite_main(meta, sub_scores, model=MAIN_MODEL):
+    """单次 Claude 调用：读 5 个子分 + 标题/方向 → {composite, reason}。解析失败返回 None。"""
+    user = (f"标题：{meta.get('title')}\n方向：{meta.get('area') or '、'.join(meta.get('categories') or [])}\n"
+            f"五个子维度分（已定，勿改）：\n{json.dumps(sub_scores, ensure_ascii=False, indent=2)}")
+    content, _ = relay.relay_chat(COMPOSITE_SYS, user, temperature=0.2, model=model, max_tokens=500)
+    return _extract_top_object(content)
+
+
+def generate_composite(meta, sub_scores, cross_check_on=False, model=MAIN_MODEL):
+    """
+    综评编排。现在：单次 composite_main。返回 {score: float|None, reason: str, na: bool}。
+    失败/空 → na=True, score=None（绝不伪造 0，排序置底）。
+    预留 cross_check_on：日后可接 composite_review(luna) → composite_finalize(Claude)。
+    """
+    try:
+        obj = composite_main(meta, sub_scores, model) or {}
+    except Exception as e:
+        print(f"[composite][WARN] {meta.get('arxiv_id')}: {e}")
+        return {"score": None, "reason": "", "na": True}
+    try:
+        score = float(obj.get("composite"))
+    except (TypeError, ValueError):
+        return {"score": None, "reason": (obj.get("reason") or "").strip(), "na": True}
+    return {"score": round(max(0.0, min(10.0, score)), 1),
+            "reason": (obj.get("reason") or "").strip(), "na": False}
+    # 日后：if cross_check_on: composite_review(luna) → composite_finalize(Claude)
+
+
+# ---------------------------------------------------------------------------
 # 归一化 / 计算
 # ---------------------------------------------------------------------------
 

@@ -313,6 +313,49 @@ def get_push_batch(conn, area_order, limit=500):
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
+def get_top30_batch(conn, limit=30):
+    """当日 top-N 候选：相关论文，按最新（published 降序）取 limit 篇。不按是否推送过过滤——
+    这是每日榜单，可重复生成；打分/综评/深读/推送各自增量去重。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT dp.arxiv_id, dp.area
+            FROM daily_paper dp JOIN papers pa ON pa.arxiv_id = dp.arxiv_id
+            WHERE dp.is_relevant IS TRUE
+            ORDER BY pa.published DESC NULLS LAST, dp.arxiv_id DESC
+            LIMIT %s;
+            """, (limit,))
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+
+def upsert_composite(conn, arxiv_id, score, reason):
+    """只写 composite_score / composite_reason 两列（加法式，绝不触碰 5 个子分）。
+    需 daily_score 行已存在（综评在打分之后跑）。失败/NA 时传 score=None。"""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE daily_score SET composite_score=%s, composite_reason=%s "
+                    "WHERE arxiv_id=%s;", (score, reason, arxiv_id))
+    conn.commit()
+
+
+def top30_already_pushed(conn, key):
+    """top-30 概览/深读文件是否已成功推送过（按 key，非 arxiv_id）。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM daily_top30_push WHERE key=%s AND status='success' LIMIT 1;",
+                    (key,))
+        return cur.fetchone() is not None
+
+
+def top30_record_push(conn, key, status, detail=None):
+    """记录一条 top-30 推送（overview_{date} / study_{arxiv_id}）。success 冲突则忽略（幂等）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO daily_top30_push (key, status, detail) VALUES (%s,%s,%s) "
+            "ON CONFLICT (key) DO UPDATE SET status=EXCLUDED.status, "
+            "detail=EXCLUDED.detail, pushed_at=NOW();",
+            (key, status, detail))
+    conn.commit()
+
+
 def get_stage_status(conn, arxiv_id):
     """返回 {digest, scored, studied} 三个布尔：各阶段是否已完成（对应 *_at 是否非空）。"""
     with conn.cursor() as cur:
@@ -341,7 +384,8 @@ def get_score(conn, arxiv_id):
     cols = ["freshness_score", "freshness_label", "repro_score", "novelty_total",
             "paper_type", "domain",
             "domain_relevance_score", "authority_score", "authority_na",
-            "authority_institutions", "authority_venue"]
+            "authority_institutions", "authority_venue",
+            "composite_score", "composite_reason"]
     with conn.cursor() as cur:
         cur.execute(f"SELECT {', '.join(cols)} FROM daily_score WHERE arxiv_id=%s;",
                     (arxiv_id,))

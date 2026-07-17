@@ -811,6 +811,125 @@ def _ensure_study(conn, aid):
     return conn, True
 
 
+def _ensure_composite(conn, aid):
+    """确保该篇有综评；缺则读 5 个真实子分 → scorer.generate_composite → 落库（只写 composite 两列）。
+    未打分则跳过。返回 (conn, has_composite)。绝不改 5 个子分。"""
+    import scorer
+    sc = db.get_score(conn, aid)
+    if not sc:
+        return conn, False                       # 未打分，不能综评
+    if sc.get("composite_score") is not None:
+        return conn, True                        # 增量：已综评
+    meta = (db.get_papers(conn, [aid]) or [{}])[0]
+    row = db.get_daily_row(conn, aid) or {}
+    meta = dict(meta); meta["area"] = row.get("area")
+
+    def fv(x):
+        return float(x) if x is not None else None
+    sub = {
+        "freshness": fv(sc.get("freshness_score")),
+        "reproducibility": fv(sc.get("repro_score")),
+        "novelty": fv(sc.get("novelty_total")),
+        "paper_type": sc.get("paper_type"),
+        "domain_relevance": fv(sc.get("domain_relevance_score")),
+        "authority": ("N/A" if sc.get("authority_na") else fv(sc.get("authority_score"))),
+    }
+    res = scorer.generate_composite(meta, sub)   # 单次 Claude；失败 → na（不伪造 0）
+    conn = db.ensure(conn)
+    db.upsert_composite(conn, aid, res["score"], res["reason"] or None)
+    print(f"    [composite] {aid} -> {res['score'] if not res['na'] else 'N/A'}"
+          f"  {res['reason'][:44]}")
+    return conn, (not res["na"])
+
+
+def run_top30(conn, fetch_n=30, study_top=6):
+    """
+    每日 Top-N 榜单模式：选最新相关 N 篇 → 真实 5 维打分（增量）→ 综评 0-10（增量）→
+    按综评降序 → 深读前 study_top 篇（增量）→ 生成一页概览 → 推送（概览每天一次 + 各深读文件一次）。
+    5 个子分为既有 scorer 的真实结果，综评为加法层，绝不改写子分。
+    """
+    import assemble
+    import wecom
+    conn = db.ensure(conn)
+    batch = db.get_top30_batch(conn, fetch_n)
+    if not batch:
+        print("  无相关论文可选（先跑筛选）。")
+        return {"candidates": 0}
+    ids = [a for a, _ in batch]
+    print(f"[top30] 候选 {len(ids)} 篇（最新相关）：{', '.join(ids)}")
+
+    # 1) 打分（真实 5 维，含 Claude→luna→Claude 交叉复核；增量）
+    print("\n[top30] 打分（scorer.generate_score，增量）…")
+    for aid in ids:
+        conn, _ = _ensure_score(conn, aid)
+    # 2) 综评（读 5 子分 → 0-10 + 中文理由；增量）
+    print("\n[top30] 综评（composite，增量）…")
+    for aid in ids:
+        conn, _ = _ensure_composite(conn, aid)
+    # 3) 排序：综评降序，N/A 置底
+    comps = {}
+    for aid in ids:
+        sc = db.get_score(conn, aid)
+        comps[aid] = (float(sc["composite_score"])
+                      if sc and sc.get("composite_score") is not None else None)
+    ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
+    print("\n[top30] 综评排序：" + " | ".join(
+        f"{a}={comps[a] if comps[a] is not None else 'N/A'}" for a in ranked))
+    # 4) 深读综评前 study_top（增量）
+    print(f"\n[top30] 深度精读综评前 {study_top} 篇（增量）…")
+    studied = []
+    for aid in ranked[:study_top]:
+        conn, ok = _ensure_study(conn, aid)
+        if ok:
+            studied.append(aid)
+    # 5) 概览
+    date_str = datetime.date.today().isoformat()
+    conn = db.ensure(conn)
+    overview = assemble.assemble_overview(conn, ranked, studied, date_str)
+    print(f"\n[top30] 概览：{overview}")
+
+    # 6) 推送：概览每天一次 + 每个深读文件一次（各自去重）
+    pushed = {"overview": False, "studies": 0, "skipped": 0, "failed": 0}
+    if not wecom.WEBHOOK:
+        print("[top30][push][WARN] 未设置 WECOM_WEBHOOK_URL，跳过推送（文件已生成）。")
+        return {"candidates": len(ids), "ranked": ranked, "comps": comps,
+                "studied": studied, "overview_path": overview, "pushed": pushed}
+    conn = db.ensure(conn)
+    ov_key = f"overview_{date_str}"
+    if db.top30_already_pushed(conn, ov_key):
+        print("[top30][push] 概览今日已推，跳过。")
+        pushed["skipped"] += 1
+    else:
+        ok, detail = wecom.push_file(
+            f"📊 今日 Top{len(ranked)} 论文精选 · {date_str}（附综评前 {len(studied)} 篇深读）", overview)
+        conn = db.ensure(conn)
+        db.top30_record_push(conn, ov_key, "success" if ok else "failed", str(detail)[:400])
+        pushed["overview"] = ok
+        print(f"[top30][push] 概览 -> {'成功' if ok else '失败'}：{detail}")
+        time.sleep(4)
+    for aid in studied:
+        conn = db.ensure(conn)
+        skey = f"study_{aid}"
+        if db.top30_already_pushed(conn, skey):
+            pushed["skipped"] += 1
+            continue
+        row = db.get_daily_row(conn, aid) or {}
+        sp = row.get("deep_study_path")
+        if not sp or not os.path.exists(sp):
+            continue
+        meta = (db.get_papers(conn, [aid]) or [{}])[0]
+        ok, detail = wecom.push_file(f"📄 深读：{meta.get('title') or aid}", sp)
+        conn = db.ensure(conn)
+        db.top30_record_push(conn, skey, "success" if ok else "failed", str(detail)[:400])
+        pushed["studies"] += 1 if ok else 0
+        pushed["failed"] += 0 if ok else 1
+        print(f"[top30][push] 深读 {aid} -> {'成功' if ok else '失败'}：{detail}")
+        time.sleep(4)
+
+    return {"candidates": len(ids), "ranked": ranked, "comps": comps,
+            "studied": studied, "overview_path": overview, "pushed": pushed}
+
+
 def run_deliverables(conn, push_limit, study_limit):
     """
     以「推送批次」为核心，让三件产物围绕同一批最新论文，输出一致的完整交付物：
@@ -974,6 +1093,9 @@ def main():
     score_limit = _arg_int("--score-limit", SCORE_LIMIT)
     study_limit = _arg_int("--study-limit", STUDY_LIMIT)
     push_limit = _arg_int("--push-limit", PUSH_LIMIT)
+    top30_mode = "--top30" in sys.argv
+    top30_fetch = _arg_int("--top30-fetch", 30)
+    top30_study = _arg_int("--top30-study", 6)
 
     conn = db.get_connection()
     db.ensure_schema(conn)  # 幂等，确保表就位
@@ -1004,6 +1126,24 @@ def main():
         print(f"  backlog {stats['backlog']}：候选 {stats['candidates']} / 甲未命中 {stats['noncandidates']}")
         print(f"  判定相关 {sum(rel.values())} 篇 — " + (", ".join(f"{a}:{c}" for a, c in rel.items()) or "无"))
         print(f"  not_relevant {stats['not_relevant']}，uncertain {stats['uncertain']}")
+
+    # ---- Step 3（模式分支）----
+    if top30_mode:
+        # Top-N 榜单模式：打分 → 综评 → 排序 → 深读前 N → 概览 → 推送
+        print(f"\n== Step 3: Top-{top30_fetch} 榜单（打分→综评→排序→深读前 {top30_study}→概览→推送）==")
+        conn = db.ensure(conn)
+        t = run_top30(conn, fetch_n=top30_fetch, study_top=top30_study)
+        print("\n== Top 榜单结果 ==")
+        if t.get("candidates", 0) == 0:
+            print("  无候选（先确保有相关论文）。")
+        else:
+            p = t["pushed"]
+            print(f"  候选 {t['candidates']} 篇；深读 {len(t['studied'])} 篇；概览 {t['overview_path']}")
+            print(f"  推送：概览 {'成功' if p['overview'] else ('跳过' if p['skipped'] else '失败')}，"
+                  f"深读文件成功 {p['studies']}，失败 {p['failed']}，已推过跳过 {p['skipped']}。")
+        print("\n[done] Top 榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
+        conn.close()
+        return
 
     # ---- Step 3: 交付批次（一致化）：选批次 → 补齐 digest+score+deep-study → 组装 → 推送 ----
     # 三件产物围绕【同一批最新论文】：先定推送批次，再对这批补齐导读/打分，

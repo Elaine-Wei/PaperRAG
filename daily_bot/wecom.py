@@ -92,6 +92,27 @@ def format_scores(sc):
     return "\n".join(lines)
 
 
+def push_file(intro_md, file_path, webhook=None):
+    """推送一个文件：先发一条 markdown 说明，再 upload_media→media_id→发送文件。返回 (ok, detail)。
+    用于 top-30 概览 HTML 与深读文件。去重/限流由调用方负责。"""
+    webhook = webhook or WEBHOOK
+    if not webhook:
+        return False, "WECOM_WEBHOOK_URL 未设置"
+    if intro_md:
+        ok1, j1 = send_markdown(webhook, intro_md[:4000])
+        if not ok1:
+            return False, f"markdown 失败: {j1}"
+        time.sleep(SEND_GAP)
+    media_id, ju = upload_file(webhook, file_path)
+    if not media_id:
+        return False, f"上传文件失败: {ju}"
+    time.sleep(SEND_GAP)
+    ok2, j2 = send_file(webhook, media_id)
+    if not ok2:
+        return False, f"发送文件消息失败: {j2}"
+    return True, f"ok (media_id={str(media_id)[:10]}…)"
+
+
 def push_paper(title, area, summary, scores_text, file_path, webhook=None):
     """推送一篇：markdown + 文件。返回 (ok, detail)。"""
     webhook = webhook or WEBHOOK

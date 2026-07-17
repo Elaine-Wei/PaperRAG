@@ -81,3 +81,17 @@ ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS authority_reason TEXT;
 ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS authority_institutions JSONB;
 ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS authority_venue TEXT;
 ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS authority_na BOOLEAN;
+
+-- 综评（composite）：读取 5 个真实子分后由 Claude 给 0-10 综评分 + 中文综评理由（兼作入选理由）。
+-- 加法式，绝不改写 5 个子分；失败 → 留空(NULL)，排序时置底（不伪造 0）。
+ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS composite_score NUMERIC(3,1);
+ALTER TABLE daily_score ADD COLUMN IF NOT EXISTS composite_reason TEXT;
+
+-- top-30 每日概览 / 深读文件的推送去重（与按篇 daily_push 解耦；键非 arxiv_id，故独立建表避开 FK）
+--   overview_{date} —— 当日概览每天只推一次；study_{arxiv_id} —— 每篇深读文件只推一次
+CREATE TABLE IF NOT EXISTS daily_top30_push (
+    key        TEXT PRIMARY KEY,       -- 'overview_2026-07-18' | 'study_2607.10934'
+    status     TEXT NOT NULL,          -- 'success' | 'failed'
+    pushed_at  TIMESTAMP DEFAULT NOW(),
+    detail     TEXT
+);
