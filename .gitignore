@@ -20,3 +20,13 @@ seen_ids.json
 # 系统文件
 .DS_Store
 daily_bot/output/
+
+# 生成产物 / 临时文件（只入库源码，不入库产物）
+*.pdf
+*.pkl
+agent操作手册.md
+# 仓库根目录下的生成 HTML（如 DAgger 精读稿）——单独一行，gitignore 不支持行尾注释
+/*.html
+
+# 一次性 recon/诊断脚本与产物（非流水线源码）
+daily_bot/venue_multicheck.py

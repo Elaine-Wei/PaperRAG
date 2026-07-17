@@ -63,16 +63,17 @@ def load_env_file(path=None):
 
 load_env_file()
 
-# 筛选模块：甲（关键词粗召回）、乙（stage-B AI 分类）、共享 relay 调用
+# 筛选模块：甲（关键词粗召回）、乙（stage-B AI 分类）、共享 relay 调用、DB 层
 sys.path.insert(0, CRAWLER_DIR)  # 便于 paper_filter 复用 crawler/config.py
 import paper_filter
 import stage_b
 import relay
+import db  # 数据库层（Supabase）：ingest / 队列 / 持久化筛选结果
 
-# LLM relay（OpenAI 兼容）
+# LLM relay（OpenAI 兼容）——默认值统一引用 relay 模块的单一真源，避免分叉
 RELAY_API_KEY = os.environ.get("RELAY_API_KEY")
-RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "https://a6.a6api.com/v1")
-RELAY_MODEL = os.environ.get("RELAY_MODEL", "claude-fable-5")
+RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", relay.DEFAULT_BASE_URL)
+RELAY_MODEL = os.environ.get("RELAY_MODEL", relay.DEFAULT_MODEL)
 
 # arXiv
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
@@ -84,6 +85,12 @@ NAMESPACES = {
 
 # 抓取参数：每个查询最多抓多少篇（给筛选留足材料）
 FETCH_PER_QUERY = 30
+
+# 各阶段每轮上限（成本控制；均可用 --xxx-limit=N 覆盖；<=0 表示不限）：
+DIGEST_LIMIT = 5   # 导读
+SCORE_LIMIT = 10   # 打分（cross-check ON，每篇 3 次调用）
+STUDY_LIMIT = 3    # 深度精读（multi-pass，很慢）
+PUSH_LIMIT = 10    # 推送（组装 + 发到企业微信）
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +160,13 @@ def _parse_with_et(xml_data):
         if not pdf_url and arxiv_id:
             pdf_url = f"http://arxiv.org/pdf/{arxiv_id}"
 
+        comment_el = entry.find("arxiv:comment", NAMESPACES)
+        arxiv_comment = " ".join(comment_el.text.split()) \
+            if comment_el is not None and comment_el.text else None
+        jref_el = entry.find("arxiv:journal_ref", NAMESPACES)
+        journal_ref = " ".join(jref_el.text.split()) \
+            if jref_el is not None and jref_el.text else None
+
         papers.append(
             {
                 "arxiv_id": arxiv_id,
@@ -162,6 +176,8 @@ def _parse_with_et(xml_data):
                 "categories": categories,
                 "published": published,
                 "pdf_url": pdf_url,
+                "arxiv_comment": arxiv_comment,
+                "journal_ref": journal_ref,
             }
         )
     return papers
@@ -213,6 +229,11 @@ def _parse_with_regex(xml_data):
         if not pdf_url and arxiv_id:
             pdf_url = f"http://arxiv.org/pdf/{arxiv_id}"
 
+        cmt_m = re.search(r"<arxiv:comment>(.*?)</arxiv:comment>", block, re.S)
+        arxiv_comment = _clean(cmt_m.group(1)) if cmt_m else None
+        jref_m = re.search(r"<arxiv:journal_ref>(.*?)</arxiv:journal_ref>", block, re.S)
+        journal_ref = _clean(jref_m.group(1)) if jref_m else None
+
         papers.append(
             {
                 "arxiv_id": arxiv_id,
@@ -222,6 +243,8 @@ def _parse_with_regex(xml_data):
                 "categories": categories,
                 "published": published,
                 "pdf_url": pdf_url,
+                "arxiv_comment": arxiv_comment,
+                "journal_ref": journal_ref,
             }
         )
     return papers
@@ -552,95 +575,455 @@ def render_html(paper, digest, css):
 # 主流程
 # ---------------------------------------------------------------------------
 
-def main():
-    today = datetime.date.today().isoformat()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def run_filter(conn):
+    """
+    对 backlog（daily_paper.filtered_at IS NULL）做一次性筛选：
+    甲（逐篇打 loose area 标签）→ 乙（stage-B 分类候选）→ 把结果持久化（set_filter_result）。
+    每篇只筛一次；下次运行不会重筛。返回统计 dict。
+    """
+    backlog_ids = db.get_unfiltered(conn)
+    if not backlog_ids:
+        return {"backlog": 0}
+    backlog = db.get_papers(conn, backlog_ids)
 
-    if not RELAY_API_KEY:
-        print("[WARN] RELAY_API_KEY 未设置：导读步骤会失败并用摘要兜底。"
-              "设置后重跑可得到真正的中文导读。")
+    # 甲：逐篇 loose 匹配
+    for p in backlog:
+        p["area_signals"] = paper_filter.match_signals(p)
+        p["areas"] = list(p["area_signals"].keys())
+    candidates = [p for p in backlog if p["areas"]]
+    noncandidates = [p for p in backlog if not p["areas"]]
+    print(f"[甲] backlog {len(backlog)} 篇 → 候选 {len(candidates)}，甲未命中 {len(noncandidates)}")
 
-    print("== Step 2: 抓取（拓宽后的查询集）==")
-    papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
-    print(f"[fetch] 共获得 {len(papers)} 篇（去重后）")
-    if not papers:
-        print("[ERROR] 没有抓到任何论文，退出。")
-        return
+    sb = stage_b.classify(candidates) if candidates else {"verdicts": {}}
+    if candidates and not sb.get("verdicts"):
+        # 乙 整体失败（如 relay 不可达）：本轮不落库，backlog 保留，下次重试
+        print("[乙][WARN] stage-B 整体失败，本轮不落库，backlog 保留待下次重试。")
+        return {"backlog": len(backlog), "aborted": True}
 
-    print("== Step 3: 甲（宽松粗召回）==")
-    candidates = paper_filter.coarse_candidates(papers)
-    print(f"[甲] 候选池 {len(candidates)} 篇交给 stage-B")
-    if not candidates:
-        print("[ERROR] 粗召回后没有候选，退出。")
-        return
-    # 候选池的 loose area 覆盖（一篇可带多个 tag）：确认小众方向也进了 stage-B
-    area_cover = {}
+    conn = db.ensure(conn)  # stage-B 批量调用耗时较久，落库前确保连接可用
+    # 甲未命中 → not_relevant（确定性，直接落库）
+    for p in noncandidates:
+        db.set_filter_result(conn, p["arxiv_id"], "not_relevant", "甲：分类/关键词未命中", False)
+
+    per_area, n_notrel, n_uncertain = {}, 0, 0
     for p in candidates:
-        for a in p.get("areas") or []:
-            area_cover[a] = area_cover.get(a, 0) + 1
-    cover_str = ", ".join(f"{a}:{area_cover.get(a, 0)}" for a in paper_filter.A_CLASS_ORDER)
-    print(f"[甲] 候选池 loose 方向覆盖（可重叠）：{cover_str}")
+        area = p.get("stage_b_area")
+        reason = p.get("stage_b_reason", "") or ""
+        if area in paper_filter.FOCUS_AREAS:
+            db.set_filter_result(conn, p["arxiv_id"], area, reason, True)
+            per_area[area] = per_area.get(area, 0) + 1
+        elif area == "not_relevant":
+            db.set_filter_result(conn, p["arxiv_id"], "not_relevant", reason, False)
+            n_notrel += 1
+        else:
+            # 乙未判定(uncertain)：保守记 not_relevant，保证 filter-once（不无限重筛）
+            db.set_filter_result(conn, p["arxiv_id"], "not_relevant", "乙：未判定(uncertain)", False)
+            n_uncertain += 1
 
-    print("\n== Step 4: 乙（stage-B / LLM 分类）==")
-    sb = stage_b.classify(candidates)
-    if not sb["verdicts"]:
-        # stage-B 整体失败（如无 key / relay 不可达）→ 回退到甲的关键词精选
-        print("[WARN] stage-B 未产出任何判定，回退到甲的关键词精选。")
-        report = paper_filter.select(papers)
-        print(paper_filter.format_report(report, fetched_count=len(papers)))
-        picked = report["selected"]
-    else:
-        print(stage_b.format_report(candidates, sb))
-        final = paper_filter.final_select_by_area(candidates)
-        print()
-        print(paper_filter.format_final_selection(final))
-        picked = final["selected"]
+    return {"backlog": len(backlog), "candidates": len(candidates),
+            "noncandidates": len(noncandidates), "relevant_per_area": per_area,
+            "not_relevant": len(noncandidates) + n_notrel, "uncertain": n_uncertain}
 
-    if not picked:
-        print("[ERROR] 筛选后没有任何论文可导读，退出。")
-        return
+
+def run_digest(conn, limit):
+    """
+    处理导读 backlog：is_relevant=TRUE AND digest_at IS NULL（仅前 limit 篇，成本控制）。
+    每篇生成中英双语导读 HTML → 写 output/ → 落库（digest_path + digest_at）。
+    仅在导读成功时落库；LLM 失败（degraded）不落库，留待下次重试。返回统计。
+    """
+    limit = None if (limit is not None and limit <= 0) else limit
+    # 方向轮转取 backlog：跨方向交替，避免 agent 独占（小方向 lob/ai4math 也能尽快导读）
+    rr = db.get_undigested_round_robin(conn, paper_filter.A_CLASS_ORDER,
+                                       limit=(limit or 100000))
+    if not rr:
+        return {"picked": 0, "done": 0, "degraded": 0}
+    ids = [aid for aid, _ in rr]
+    by_id = {p["arxiv_id"]: p for p in db.get_papers(conn, ids)}
+    ordered = [by_id[i] for i in ids if i in by_id]  # 保持轮转顺序
 
     css = load_css()
-
-    print("\n== Step 5: 导读 + HTML ==")
-    written = []
-    for paper in picked:
-        tag = paper.get("stage_b_area") or (",".join(paper.get("areas") or []) or "fallback")
-        print(f"[paper] {paper['arxiv_id']} [{tag}] — {paper.get('title')}")
+    today = datetime.date.today().isoformat()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    done, degraded = 0, 0
+    for paper in ordered:
+        print(f"[digest] {paper['arxiv_id']} [{ (db_area(conn, paper['arxiv_id'])) }] — {(paper.get('title') or '')[:50]}")
         digest = generate_digest(paper)
-
-        # 导读结果小结（成功 / 兜底、中英预览、token 用量）
         if digest.get("degraded"):
-            print(f"[digest] {paper['arxiv_id']}: 失败，已用摘要兜底")
-        else:
-            zh, en = digest.get("zh", {}), digest.get("en", {})
-            zh_prev = " / ".join(s for s in (zh.get("hook"), zh.get("problem")) if s)
-            en_prev = " / ".join(s for s in (en.get("hook"), en.get("problem")) if s)
-            print(f"[digest] {paper['arxiv_id']}: 成功（中英双语）")
-            print(f"         zh: {zh_prev[:100]}")
-            print(f"         en: {en_prev[:100]}")
-            usage = digest.get("usage")
-            if usage:
-                print(f"[usage]  {paper['arxiv_id']}: {json.dumps(usage, ensure_ascii=False)}")
-            else:
-                print(f"[usage]  {paper['arxiv_id']}: relay 未返回 usage 字段")
+            degraded += 1
+            print(f"[digest][WARN] {paper['arxiv_id']}: LLM 失败(degraded)，不落库，下次重试")
+            continue
+        doc = render_html(paper, digest, css)
+        safe_id = paper["arxiv_id"].replace("/", "_")
+        path = os.path.join(OUTPUT_DIR, f"{today}_{safe_id}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+        conn = db.ensure(conn)  # 导读 LLM 后确保连接可用
+        db.mark_stage(conn, paper["arxiv_id"], "digest", path)  # digest_at + digest_path
+        done += 1
+        zh = digest.get("zh", {})
+        print(f"    -> 成功，已落库 digest_path；zh: {(zh.get('hook') or '')[:60]}")
+    return {"picked": len(ordered), "done": done, "degraded": degraded}
 
+
+def db_area(conn, arxiv_id):
+    with conn.cursor() as cur:
+        cur.execute("SELECT area FROM daily_paper WHERE arxiv_id=%s;", (arxiv_id,))
+        r = cur.fetchone()
+        return r[0] if r else "?"
+
+
+def _score_dict(scorer, res):
+    """把 scorer.generate_score 的返回整理成 db.upsert_score 需要的字段。"""
+    norm, fresh = res["norm"], res["fresh"]
+    return {
+        "freshness_score": fresh["score"], "freshness_days": fresh["days"],
+        "freshness_label": fresh["label"],
+        "repro_score": res["repro_total"], "repro_overall_reason": norm["repro_overall"],
+        "repro_subitems": {k: {"score": v["score"], "reason": v["reason"],
+                               "weight": scorer.REPRO_WEIGHTS[k]}
+                           for k, v in norm["repro_subs"].items()},
+        "novelty_score": int(round(res["novelty_total"])),
+        "novelty_reason": norm["novelty_overall"],
+        "novelty_total": res["novelty_total"], "paper_type": norm["paper_type"],
+        "novelty_subitems": {k: {"score": v["score"], "reason": v["reason"]}
+                             for k, v in norm["novelty_subs"].items()},
+        "domain": norm["domain"], "model": scorer.MAIN_MODEL,
+        "cross_checked": True, "cross_notes": res["cross_notes"],
+        # 两个新维度：领域相关性 + 权威性（authority na → 不写分数，标 na 非 0）
+        "domain_relevance_score": (res.get("domain_relevance") or {}).get("score")
+        if res.get("domain_relevance") else None,
+        "domain_relevance_reason": (res.get("domain_relevance") or {}).get("reason")
+        if res.get("domain_relevance") else None,
+        "authority_score": None if (res.get("authority") or {}).get("na")
+        else (res.get("authority") or {}).get("score"),
+        "authority_reason": (res.get("authority") or {}).get("reason"),
+        "authority_institutions": (res.get("authority") or {}).get("institutions") or [],
+        "authority_venue": (res.get("authority") or {}).get("venue"),
+        "authority_na": bool((res.get("authority") or {"na": True}).get("na", True)),
+    }
+
+
+def run_score(conn, limit):
+    """打分 backlog：相关+已导读+未打分（前 limit 篇）。复用 scorer；结果落库 + 标记 scored_at。"""
+    import scorer
+    ids = db.get_scorable(conn, limit if limit and limit > 0 else 100000)
+    if not ids:
+        return {"picked": 0, "done": 0}
+    done = 0
+    for aid in ids:
+        print(f"[score] {aid} …（cross-check ON）")
         try:
-            doc = render_html(paper, digest, css)
-            safe_id = paper["arxiv_id"].replace("/", "_")
-            path = os.path.join(OUTPUT_DIR, f"{today}_{safe_id}.html")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(doc)
-            written.append(path)
-            print(f"[html] 已写出 {path}"
-                  + ("（兜底：摘要）" if digest.get("degraded") else ""))
+            res = scorer.generate_score(aid, cross_check_on=True)
         except Exception as e:
-            print(f"[WARN] 生成 HTML 失败 ({paper['arxiv_id']}): {e}")
+            print(f"[score][WARN] {aid} 打分失败：{e}")
+            continue
+        conn = db.ensure(conn)  # 打分 LLM 耗时较久，写库前确保连接仍可用
+        db.upsert_score(conn, aid, _score_dict(scorer, res))
+        db.mark_stage(conn, aid, "score", res["path"])
+        done += 1
+        norm, fresh = res["norm"], res["fresh"]
+        print(f"    -> {os.path.basename(res['path'])}  fresh {fresh['score']} · "
+              f"repro {res['repro_total']} · novelty {res['novelty_total']}({norm['paper_type']})")
+    return {"picked": len(ids), "done": done}
 
-    print("\n== 完成 ==")
-    print(f"抓取 {len(papers)} 篇 → 挑选 {len(picked)} 篇 → 生成 {len(written)} 个 HTML：")
-    for path in written:
-        print(f"  {path}")
+
+def run_study(conn, limit):
+    """深度精读 backlog：相关+已导读+未精读，方向轮转取 limit 篇。multi-pass（gpt-5.6-luna）。"""
+    import deep_study
+    rr = db.get_unstudied_round_robin(conn, paper_filter.A_CLASS_ORDER,
+                                      limit=(limit if limit and limit > 0 else 100000))
+    studied = []
+    for aid, area in rr:
+        print(f"[study] {aid} [{area}] …（multi-pass / {deep_study.DEFAULT_MODEL}，较慢）")
+        try:
+            sres = deep_study.generate_study(aid, model=deep_study.DEFAULT_MODEL)
+        except Exception as e:
+            print(f"[study][WARN] {aid} 失败：{e}")
+            continue
+        path = sres.get("path")
+        conn = db.ensure(conn)  # 深度精读极慢，写库前确保连接仍可用
+        db.mark_stage(conn, aid, "deep_study", path)
+        studied.append(aid)
+        print(f"    -> {os.path.basename(path) if path else '?'}")
+    return studied
+
+
+# ---------------------------------------------------------------------------
+# 以「推送批次」为核心的一致化交付：digest / score / deep-study 都围绕同一批最新论文
+# ---------------------------------------------------------------------------
+
+def _ensure_digest(conn, aid, css):
+    """确保该篇有导读；缺则生成并落库。返回 (conn, has_digest)。"""
+    if db.get_stage_status(conn, aid)["digest"]:
+        return conn, True
+    paper = (db.get_papers(conn, [aid]) or [None])[0]
+    if not paper:
+        return conn, False
+    digest = generate_digest(paper)
+    if digest.get("degraded"):
+        print(f"    [digest][WARN] {aid} degraded，不落库（下轮重试）")
+        return conn, False
+    doc = render_html(paper, digest, css)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR,
+                        f"{datetime.date.today().isoformat()}_{aid.replace('/', '_')}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    conn = db.ensure(conn)  # 导读 LLM 后确保连接可用
+    db.mark_stage(conn, aid, "digest", path)
+    print(f"    [digest] {aid} 生成")
+    return conn, True
+
+
+def _ensure_score(conn, aid):
+    """确保该篇有评分；缺则生成并落库。返回 (conn, has_score)。"""
+    import scorer
+    if db.get_stage_status(conn, aid)["scored"]:
+        return conn, True
+    try:
+        res = scorer.generate_score(aid, cross_check_on=True)
+    except Exception as e:
+        print(f"    [score][WARN] {aid}: {e}")
+        return conn, False
+    conn = db.ensure(conn)  # 打分 LLM 耗时较久，写库前确保连接可用
+    db.upsert_score(conn, aid, _score_dict(scorer, res))
+    db.mark_stage(conn, aid, "score", res["path"])
+    norm, fresh = res["norm"], res["fresh"]
+    print(f"    [score] {aid} fresh {fresh['score']} · repro {res['repro_total']} · "
+          f"novelty {res['novelty_total']}({norm['paper_type']})")
+    return conn, True
+
+
+def _ensure_study(conn, aid):
+    """确保该篇有深度精读；缺则生成（multi-pass，gpt-5.6-luna）并落库。返回 (conn, has_study)。"""
+    import deep_study
+    if db.get_stage_status(conn, aid)["studied"]:
+        return conn, True
+    try:
+        sres = deep_study.generate_study(aid, model=deep_study.DEFAULT_MODEL)
+    except Exception as e:
+        print(f"    [study][WARN] {aid}: {e}")
+        return conn, False
+    path = sres.get("path")
+    conn = db.ensure(conn)  # 深度精读极慢，写库前确保连接可用
+    db.mark_stage(conn, aid, "deep_study", path)
+    print(f"    [study] {aid} -> {os.path.basename(path) if path else '?'}")
+    return conn, True
+
+
+def run_deliverables(conn, push_limit, study_limit):
+    """
+    以「推送批次」为核心，让三件产物围绕同一批最新论文，输出一致的完整交付物：
+      1) 选批次 = 最新 relevant 且尚未成功推送的论文（round-robin 跨方向），上限 push_limit；
+      2) 对整批补齐 digest + score（缺则生成）；
+      3) 对批次【前 study_limit 篇】补齐 deep-study（同一批，不再独立轮转选别的论文）；
+      4) 逐篇组装完整报告并推送（去重：已成功推过的绝不重推）。
+    这样每篇被推送的报告都是「digest + score(+ 前几篇还带 deep-study)」围绕同一批的完整交付物。
+    """
+    import assemble
+    import wecom
+
+    conn = db.ensure(conn)
+    pl = push_limit if push_limit and push_limit > 0 else 100000
+    batch = db.get_push_batch(conn, paper_filter.A_CLASS_ORDER, pl)
+    if not batch:
+        print("  本轮无新可推送论文（增量：最新的相关论文都推过了）。")
+        return {"batch": 0, "studied": 0, "pushed": 0, "failed": 0, "skipped": 0,
+                "assembled": []}
+
+    batch_ids = [aid for aid, _ in batch]
+    area_by_id = {aid: area for aid, area in batch}
+    sl = len(batch_ids) if (study_limit is None or study_limit <= 0) \
+        else min(study_limit, len(batch_ids))
+    study_ids = set(batch_ids[:sl])  # 深读 = 批次前 sl 篇（与推送同一批）
+
+    print(f"[batch] 本轮推送批次 {len(batch_ids)} 篇（前 {len(study_ids)} 篇做深度精读）：")
+    for aid in batch_ids:
+        print(f"    {aid} [{area_by_id[aid]}]" + ("  ★deep-study" if aid in study_ids else ""))
+
+    # ---- 补齐三件产物：digest + score（全批）；deep-study（前 sl 篇，同一批）----
+    css = load_css()
+    print("\n[batch] 补齐 digest / score / deep-study …")
+    for aid in batch_ids:
+        conn, has_digest = _ensure_digest(conn, aid, css)
+        if has_digest:
+            conn, _ = _ensure_score(conn, aid)
+            if aid in study_ids:
+                conn, _ = _ensure_study(conn, aid)
+
+    # ---- 组装完整报告 ----
+    print("\n[batch] 组装完整报告 …")
+    assembled = []
+    for aid in batch_ids:
+        conn = db.ensure(conn)
+        full = assemble.assemble_full(conn, aid)
+        if not full:
+            print(f"    [assemble][WARN] {aid} 无 digest，跳过（未生成完整报告）")
+            continue
+        assembled.append((aid, full))
+        print(f"    [assemble] {aid} -> {os.path.basename(full)}")
+
+    if not wecom.WEBHOOK:
+        print("[push][WARN] WECOM_WEBHOOK_URL 未设置，跳过推送（完整报告已生成）。")
+        return {"batch": len(batch_ids), "studied": len(study_ids), "pushed": 0,
+                "failed": 0, "skipped": len(assembled),
+                "assembled": [p for _, p in assembled]}
+
+    # ---- 推送（去重、限流；仅推 digest+score 齐备的，深读 best-effort）----
+    print("\n[batch] 推送企业微信 …")
+    pushed = failed = skipped = deferred = 0
+    for aid, full in assembled:
+        conn = db.ensure(conn)
+        if db.already_pushed(conn, aid):  # 去重：已成功推过的绝不重推
+            skipped += 1
+            print(f"    [push] {aid} 已推过，跳过")
+            continue
+        # 完整性门槛：digest+score 必须齐备才推（避免推「暂无评分」的半成品并被 record_push 锁死）。
+        # 缺评分通常是本轮打分瞬时失败——不推、不记录，留在批次里下轮重试补齐后再推。深读为 best-effort，缺不挡推。
+        if not db.get_stage_status(conn, aid)["scored"]:
+            deferred += 1
+            print(f"    [push] {aid} 缺评分（本轮打分失败），本轮不推，下轮补齐后再推")
+            continue
+        meta = (db.get_papers(conn, [aid]) or [{}])[0]
+        row = db.get_daily_row(conn, aid) or {}
+        sc = db.get_score(conn, aid)
+        summary = assemble.extract_hook(row.get("digest_path") or "") or "（无摘要）"
+        scores_text = wecom.format_scores(sc)  # 含领域相关性 + 权威性（得体披露）
+        print(f"    [push] {aid} → 企业微信 …")
+        ok, detail = wecom.push_paper(meta.get("title") or aid, area_by_id.get(aid, "?"),
+                                      summary, scores_text, full)
+        conn = db.ensure(conn)  # 推送含 HTTP+sleep，记录前确保连接可用
+        db.record_push(conn, aid, "success" if ok else "failed", str(detail)[:500])
+        if ok:
+            pushed += 1
+            print(f"        -> 成功：{detail}")
+        else:
+            failed += 1
+            print(f"        -> 失败：{detail}")
+        time.sleep(4)  # 论文之间也间隔，配合 20/min 限流
+
+    return {"batch": len(batch_ids), "studied": len(study_ids), "pushed": pushed,
+            "failed": failed, "skipped": skipped, "deferred": deferred,
+            "assembled": [p for _, p in assembled]}
+
+
+def run_assemble_push(conn, push_limit, studied_ids):
+    """组装完整报告（推送集 ∪ 本轮精读集），并把未推过的推到企业微信。"""
+    import assemble
+    import wecom
+    push_ids = db.get_pushable(conn, push_limit if push_limit and push_limit > 0 else 100000)
+    # 组装：推送目标 + 本轮精读的（后者即使不推也生成完整报告便于查看）
+    assemble_ids = list(dict.fromkeys(push_ids + [a for a in studied_ids]))
+    full_by_id = {}
+    for aid in assemble_ids:
+        p = assemble.assemble_full(conn, aid)
+        if p:
+            full_by_id[aid] = p
+            print(f"[assemble] {aid} -> {os.path.basename(p)}")
+
+    pushed = failed = skipped = 0
+    if not wecom.WEBHOOK:
+        print("[push][WARN] WECOM_WEBHOOK_URL 未设置，跳过推送。")
+        return {"assembled": len(full_by_id), "pushed": 0, "failed": 0,
+                "skipped": len(push_ids), "full_by_id": full_by_id}
+    for aid in push_ids:
+        if db.already_pushed(conn, aid):
+            skipped += 1
+            continue
+        full = full_by_id.get(aid) or assemble.assemble_full(conn, aid)
+        if not full:
+            print(f"[push][WARN] {aid} 无完整报告可推，跳过")
+            continue
+        meta = (db.get_papers(conn, [aid]) or [{}])[0]
+        row = db.get_daily_row(conn, aid) or {}
+        sc = db.get_score(conn, aid)
+        summary = assemble.extract_hook(row.get("digest_path") or "") or "（无摘要）"
+        if sc:
+            scores_text = (f"新鲜度 {sc['freshness_score']} · 可复现 {sc['repro_score']} · "
+                           f"新颖度 {sc['novelty_total']}（{sc['paper_type']}）")
+        else:
+            scores_text = "（暂无评分）"
+        print(f"[push] {aid} → 企业微信 …")
+        ok, detail = wecom.push_paper(meta.get("title") or aid, row.get("area") or "?",
+                                      summary, scores_text, full)
+        conn = db.ensure(conn)  # 推送含 HTTP+sleep，记录前确保连接可用
+        db.record_push(conn, aid, "success" if ok else "failed", str(detail)[:500])
+        if ok:
+            pushed += 1
+            print(f"    -> 成功：{detail}")
+        else:
+            failed += 1
+            print(f"    -> 失败：{detail}")
+        time.sleep(4)  # 论文之间也间隔，配合 20/min 限流
+    return {"assembled": len(full_by_id), "pushed": pushed, "failed": failed,
+            "skipped": skipped, "full_by_id": full_by_id}
+
+
+def _arg_int(name, default):
+    for a in sys.argv[1:]:
+        if a.startswith(name + "="):
+            try:
+                return int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+    return default
+
+
+def main():
+    limit = int(os.environ.get("DAILY_DIGEST_LIMIT", _arg_int("--digest-limit", DIGEST_LIMIT)))
+    score_limit = _arg_int("--score-limit", SCORE_LIMIT)
+    study_limit = _arg_int("--study-limit", STUDY_LIMIT)
+    push_limit = _arg_int("--push-limit", PUSH_LIMIT)
+
+    conn = db.get_connection()
+    db.ensure_schema(conn)  # 幂等，确保表就位
+
+    # ---- Step 1: 抓取 + 入库（ingest）----
+    print("== Step 1: 抓取 + 入库（ingest）==")
+    papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
+    print(f"[fetch] 抓取 {len(papers)} 篇（去重后）")
+    new = 0
+    for p in papers:
+        db.upsert_paper(conn, p)                       # 写入共享 papers（冲突忽略）
+        if db.upsert_daily_paper(conn, p["arxiv_id"]):  # 新建 daily_paper 行（阶段时间戳全 NULL）
+            new += 1
+    print(f"[ingest] 新登记 daily_paper {new} 篇；其余 {len(papers) - new} 篇已存在（增量，跳过）")
+
+    # ---- Step 2: 筛选 backlog（仅未筛过的；甲→乙；结果落库）----
+    print("\n== Step 2: 筛选 backlog（甲 → 乙，仅 filtered_at IS NULL）==")
+    conn = db.ensure(conn)
+    stats = run_filter(conn)
+
+    print("\n== 筛选结果 ==")
+    if stats.get("backlog", 0) == 0:
+        print("  本轮无待筛论文（增量：backlog 为空，说明都筛过了）。")
+    elif stats.get("aborted"):
+        print("  本轮 stage-B 失败，未落库（backlog 保留）。")
+    else:
+        rel = stats["relevant_per_area"]
+        print(f"  backlog {stats['backlog']}：候选 {stats['candidates']} / 甲未命中 {stats['noncandidates']}")
+        print(f"  判定相关 {sum(rel.values())} 篇 — " + (", ".join(f"{a}:{c}" for a, c in rel.items()) or "无"))
+        print(f"  not_relevant {stats['not_relevant']}，uncertain {stats['uncertain']}")
+
+    # ---- Step 3: 交付批次（一致化）：选批次 → 补齐 digest+score+deep-study → 组装 → 推送 ----
+    # 三件产物围绕【同一批最新论文】：先定推送批次，再对这批补齐导读/打分，
+    # 并对批次前 study_limit 篇做深度精读——避免深读跑到不在推送批次里的论文上。
+    print(f"\n== Step 3: 交付批次（最新未推送，round-robin；推送上限 {push_limit}，"
+          f"深读上限 {study_limit}）==")
+    conn = db.ensure(conn)
+    dl = run_deliverables(conn, push_limit, study_limit)
+    print("\n== 交付结果 ==")
+    if dl["batch"] == 0:
+        print("  本轮无新可推送论文（增量：最新的相关论文都推过了）。")
+    else:
+        print(f"  批次 {dl['batch']} 篇（其中 {dl['studied']} 篇带深度精读）；"
+              f"组装完整报告 {len(dl['assembled'])} 篇；"
+              f"推送成功 {dl['pushed']}，失败 {dl['failed']}，已推过跳过 {dl['skipped']}，"
+              f"缺评分延后 {dl.get('deferred', 0)}。")
+
+    print("\n[done] 全流程：ingest → 筛选 → （同一批）导读+打分+深读 → 组装 → 推送"
+          "（增量、去重、同批一致）。")
+    conn.close()
 
 
 if __name__ == "__main__":

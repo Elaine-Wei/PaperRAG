@@ -13,6 +13,8 @@ CREATE TABLE papers (
     year                       INTEGER,
     code_urls                  TEXT[],
     hf_upvotes                 INTEGER,
+    arxiv_comment              TEXT,
+    journal_ref                TEXT,
     enriched                   BOOLEAN DEFAULT FALSE,
     enriched_at                TIMESTAMP,
     created_at                 TIMESTAMP DEFAULT NOW()

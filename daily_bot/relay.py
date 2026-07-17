@@ -10,23 +10,31 @@ import json
 import os
 import urllib.request
 
+# 单一真源：relay 的默认模型与 base_url（run.py 等一律引用这里，避免默认值分叉）
+DEFAULT_MODEL = "claude-fable-5"
+DEFAULT_BASE_URL = "https://a6.a6api.com/v1"
+
 
 def _relay_config():
     return (
         os.environ.get("RELAY_API_KEY"),
-        os.environ.get("RELAY_BASE_URL", "https://a6.a6api.com/v1"),
-        os.environ.get("RELAY_MODEL", "claude-fable-5"),
+        os.environ.get("RELAY_BASE_URL", DEFAULT_BASE_URL),
+        os.environ.get("RELAY_MODEL", DEFAULT_MODEL),
     )
 
 
-def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90):
+def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90,
+               max_tokens=None, model=None):
     """
     发一条 system+user 消息，返回 (content, usage)。
     无 API key → 抛 RuntimeError；网络/HTTP/JSON 错误照常抛出，由调用方处理。
+    max_tokens：可选，限制/放开输出长度（深度精读需要很长输出时传大值）。
+    model：可选，覆盖默认模型（用于按模型切换，如 claude-fable-5 / gpt-5.6-luna）。
     """
-    api_key, base_url, model = _relay_config()
+    api_key, base_url, env_model = _relay_config()
     if not api_key:
         raise RuntimeError("环境变量 RELAY_API_KEY 未设置")
+    model = model or env_model
 
     body = {
         "model": model,
@@ -36,6 +44,8 @@ def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90):
         ],
         "temperature": temperature,
     }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),

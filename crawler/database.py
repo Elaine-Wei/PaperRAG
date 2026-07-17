@@ -1,11 +1,33 @@
+import urllib.parse
+
 import psycopg2
 
 from config import DATABASE_URL
 
 
 def get_connection():
-    """从 DATABASE_URL 返回 psycopg2 连接。"""
-    return psycopg2.connect(DATABASE_URL)
+    """
+    从 DATABASE_URL 建连接。稳健解析：把 URI 拆成 keyword 参数再连接，避免密码里未做
+    percent-encode 的特殊字符破坏 libpq 的 URI 解析（Supabase pooler 连接串常有此问题）。
+    远程库（非 localhost，如 Supabase）默认启用 SSL（sslmode=require），本地保持原行为。
+    """
+    p = urllib.parse.urlparse(DATABASE_URL)
+    if p.scheme and p.hostname:  # URI 形式
+        q = urllib.parse.parse_qs(p.query or "")
+        kw = {
+            "host": p.hostname,
+            "port": p.port or 5432,
+            "dbname": (p.path or "/postgres").lstrip("/") or "postgres",
+            "user": p.username,
+            "password": p.password,
+        }
+        sslmode = q.get("sslmode", [None])[0]
+        if sslmode:
+            kw["sslmode"] = sslmode
+        elif p.hostname not in ("localhost", "127.0.0.1", "::1"):
+            kw["sslmode"] = "require"  # 远程库默认要求 SSL
+        return psycopg2.connect(**kw)
+    return psycopg2.connect(DATABASE_URL)  # 非 URI（本地 DSN 等）保持原样
 
 
 def get_seen_ids(conn):
@@ -19,9 +41,10 @@ def insert_paper(conn, paper):
     """INSERT 一篇论文；arxiv_id 冲突时忽略。"""
     sql = """
         INSERT INTO papers (
-            arxiv_id, title, abstract, authors, categories, published, pdf_url
+            arxiv_id, title, abstract, authors, categories, published, pdf_url,
+            arxiv_comment, journal_ref
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (arxiv_id) DO NOTHING;
     """
     with conn.cursor() as cur:
@@ -35,6 +58,8 @@ def insert_paper(conn, paper):
                 paper.get("categories"),
                 paper.get("published") or None,
                 paper.get("pdf_url"),
+                paper.get("arxiv_comment"),
+                paper.get("journal_ref"),
             ),
         )
     conn.commit()

@@ -67,6 +67,17 @@ def parse_arxiv_xml(xml_data):
         if not pdf_url and arxiv_id:
             pdf_url = f"http://arxiv.org/pdf/{arxiv_id}"
 
+        # arXiv 作者自填的会议/期刊信号（最直接的发表证据）：
+        #   <arxiv:comment>  常含 "Accepted at NeurIPS 2025" / "Under review" / 页数等
+        #   <arxiv:journal_ref> 已正式发表时才有，形如 "J. of ... 39.1 (2025)"
+        # 多为 None（作者未填）；一律保留原文，规范化仅压缩空白。
+        comment_el = entry.find("arxiv:comment", NAMESPACES)
+        arxiv_comment = " ".join(comment_el.text.split()) \
+            if comment_el is not None and comment_el.text else None
+        jref_el = entry.find("arxiv:journal_ref", NAMESPACES)
+        journal_ref = " ".join(jref_el.text.split()) \
+            if jref_el is not None and jref_el.text else None
+
         papers.append(
             {
                 "arxiv_id": arxiv_id,
@@ -76,6 +87,8 @@ def parse_arxiv_xml(xml_data):
                 "categories": categories,
                 "published": published,
                 "pdf_url": pdf_url,
+                "arxiv_comment": arxiv_comment,
+                "journal_ref": journal_ref,
             }
         )
 
