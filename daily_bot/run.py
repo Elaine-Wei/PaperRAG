@@ -842,6 +842,130 @@ def _ensure_composite(conn, aid):
     return conn, (not res["na"])
 
 
+def _count_big_sections(path):
+    """完整性度量：数深读 HTML 里的 <section id="s..>（每个=一个大章节）。文件缺失→0。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().count('<section id="s')
+    except Exception:
+        return 0
+
+
+def _classify_study_error(exc):
+    """区分失败类型：relay（限流/超时，退避重试）vs content（内容问题，3 次后放弃该篇）。"""
+    s = str(exc).lower()
+    relay_sig = ("503", "429", "502", "504", "timed out", "timeout",
+                 "temporarily", "service unavailable", "bad gateway", "gateway time")
+    return "relay" if any(k in s for k in relay_sig) else "content"
+
+
+def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
+                           backoff_min=(10, 15, 20, 25, 30),
+                           min_big=4, max_content_attempts=3):
+    """
+    无人值守地把 target_ids（综评前 N 篇）跑成【完整】深读，扛住 relay 503 限流：
+      - 逐篇跑，跑完查完整性：n_big_sections >= min_big 才算成功（1-2 段=跳过正文=失败）。
+      - relay 503/超时：退避 10→15→20→25→30 分（连续失败递增，成功清零），然后换下一篇（round-robin），
+        失败的下一轮再回来；relay 失败不计入放弃次数（5h 内无限重试）。
+      - content（不完整/坏 PDF/400）：同一篇累计 max_content_attempts 次后放弃该篇。
+      - 安全阀：总时长 cap_hours 封顶，且 6 篇全完成即提前停；每次 sleep 都不超过剩余额度。
+      - 增量：已完整的深读直接跳过（可断点续跑）。
+      - 每次尝试写一行日志（时间戳/论文/rest/结果）到 top30_study_retry.log，供事后调参。
+    只包住深读步骤；打分/综评不受影响。返回 {completed, gave_up, pending, log_path}。
+    """
+    import deep_study
+    log_path = os.path.join(HERE, "top30_study_retry.log")
+
+    def logln(msg):
+        line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    start = time.time()
+    CAP = cap_hours * 3600
+    BACKOFF = [m * 60 for m in backoff_min]
+
+    def elapsed_m():
+        return int((time.time() - start) / 60)
+
+    def remaining():
+        return CAP - (time.time() - start)
+
+    pending = list(target_ids)
+    content_fails = {a: 0 for a in pending}
+    completed, gave_up = [], []
+    consec_relay = 0
+
+    # 增量：已完整的直接算完成（断点续跑）
+    for aid in list(pending):
+        row = db.get_daily_row(conn, aid) or {}
+        sp = row.get("deep_study_path")
+        if db.get_stage_status(conn, aid).get("studied") and sp and os.path.exists(sp) \
+                and _count_big_sections(sp) >= min_big:
+            completed.append(aid)
+            pending.remove(aid)
+            logln(f"paper={aid} outcome=already-complete nbig={_count_big_sections(sp)}")
+
+    logln(f"START targets={list(target_ids)} to-do={pending} cap={cap_hours}h "
+          f"min_big={min_big} backoff={list(backoff_min)}min")
+
+    rnd = 0
+    while pending and remaining() > 0:
+        rnd += 1
+        logln(f"round={rnd} start pending={pending}")
+        for aid in list(pending):
+            if remaining() <= 0:
+                break
+            att = content_fails[aid] + 1
+            try:
+                res = deep_study.generate_study(aid)
+                path = res.get("path") if isinstance(res, dict) else None
+                nbig = _count_big_sections(path) if path else 0
+                if nbig >= min_big:
+                    conn = db.ensure(conn)  # 循环含长 sleep，写库前重连
+                    db.mark_stage(conn, aid, "deep_study", path)
+                    pending.remove(aid)
+                    completed.append(aid)
+                    consec_relay = 0  # 成功 → 退避清零
+                    logln(f"round={rnd} paper={aid} attempt={att} outcome=success "
+                          f"nbig={nbig} rest=0m elapsed={elapsed_m()}m")
+                else:  # 跑完但不完整（跳过正文）→ content 失败
+                    content_fails[aid] += 1
+                    tag = " -> GIVE-UP(content)" if content_fails[aid] >= max_content_attempts else ""
+                    if content_fails[aid] >= max_content_attempts:
+                        pending.remove(aid)
+                        gave_up.append(aid)
+                    logln(f"round={rnd} paper={aid} attempt={content_fails[aid]} "
+                          f"outcome=incomplete nbig={nbig} rest=0m elapsed={elapsed_m()}m{tag}")
+            except Exception as e:
+                if _classify_study_error(e) == "relay":
+                    consec_relay += 1
+                    rest = BACKOFF[min(consec_relay - 1, len(BACKOFF) - 1)]
+                    rest = min(rest, max(0, remaining()))  # cap-aware
+                    logln(f"round={rnd} paper={aid} attempt={att} outcome=503/timeout "
+                          f"nbig=- rest={int(rest / 60)}m elapsed={elapsed_m()}m ({str(e)[:60]})")
+                    if rest > 0:
+                        time.sleep(rest)  # 歇完换下一篇（round-robin）；本篇留在 pending 下轮再来
+                else:  # content 异常（400 / 坏 PDF 等）
+                    content_fails[aid] += 1
+                    tag = " -> GIVE-UP(content)" if content_fails[aid] >= max_content_attempts else ""
+                    if content_fails[aid] >= max_content_attempts:
+                        pending.remove(aid)
+                        gave_up.append(aid)
+                    logln(f"round={rnd} paper={aid} attempt={content_fails[aid]} "
+                          f"outcome=content-error nbig=- rest=0m elapsed={elapsed_m()}m{tag} "
+                          f"({str(e)[:60]})")
+
+    reason = "all-complete" if not pending else ("cap-hit" if remaining() <= 0 else "stopped")
+    logln(f"FINISHED reason={reason} completed={completed} gave_up={gave_up} "
+          f"still_pending={pending} rounds={rnd} elapsed={elapsed_m()}m")
+    return {"completed": completed, "gave_up": gave_up, "pending": pending, "log_path": log_path}
+
+
 def run_top30(conn, fetch_n=30, study_top=6):
     """
     每日 Top-N 榜单模式：选最新相关 N 篇 → 真实 5 维打分（增量）→ 综评 0-10（增量）→
@@ -875,13 +999,14 @@ def run_top30(conn, fetch_n=30, study_top=6):
     ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
     print("\n[top30] 综评排序：" + " | ".join(
         f"{a}={comps[a] if comps[a] is not None else 'N/A'}" for a in ranked))
-    # 4) 深读综评前 study_top（增量）
-    print(f"\n[top30] 深度精读综评前 {study_top} 篇（增量）…")
-    studied = []
-    for aid in ranked[:study_top]:
-        conn, ok = _ensure_study(conn, aid)
-        if ok:
-            studied.append(aid)
+    # 4) 深读综评前 study_top（backoff + round-robin + 完整性门槛；无人值守，最长 5h）
+    print(f"\n[top30] 深度精读综评前 {study_top} 篇（backoff+round-robin，完整性≥4 段，最长 5h）…")
+    conn = db.ensure(conn)
+    sres = run_study_with_backoff(conn, ranked[:study_top])
+    studied = sres["completed"]
+    conn = db.ensure(conn)  # 退避循环含长 sleep，之后重连
+    print(f"[top30] 深读完成 {len(studied)} 篇；放弃 {len(sres['gave_up'])} 篇"
+          f"（内容问题）；日志 {sres['log_path']}")
     # 5) 概览
     date_str = datetime.date.today().isoformat()
     conn = db.ensure(conn)
