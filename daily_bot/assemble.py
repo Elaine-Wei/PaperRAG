@@ -76,6 +76,9 @@ def assemble_full(conn, arxiv_id):
     study_inner = ""
     if row.get("deep_study_path") and os.path.exists(row["deep_study_path"]):
         study_inner = _body_inner(_read(row["deep_study_path"]))
+        # 若深读已在顶部注入过评分卡（top-30 模式），这里剥掉，避免完整报告里评分卡重复
+        study_inner = re.sub(r"<!--SCORECARD-INJECTED-->.*?<!--/SCORECARD-INJECTED-->",
+                             "", study_inner, flags=re.S)
 
     parts = [_sep("简报 · Digest"), digest_inner,
              _sep("评分卡 · Score"),
@@ -131,6 +134,37 @@ border-radius:6px;padding:8px 10px;margin:6px 0;line-height:1.6}
 .ov-reason{font-size:.92rem;color:#1a1a1a;margin-top:6px}
 .ov-reason b{color:#c0392b}
 """
+
+
+def prepend_score_card_to_study(study_path, score_path):
+    """
+    把评分卡插到深读 HTML 顶部（第0部分），让每篇精读开门见山先看本篇 5 维雷达+综评。
+    复用已渲染好的评分卡（score_path 的 <body> 内容）+ 注入 scorer.CSS。幂等（marker 包裹，
+    可被 assemble_full 剥离以免完整报告重复）。评分数字不变，只是前置呈现。返回 True 成功/已注入。
+    """
+    if not (study_path and os.path.exists(study_path)):
+        return False
+    h = _read(study_path)
+    if "SCORECARD-INJECTED" in h:
+        return True  # 幂等：已注入
+    if not (score_path and os.path.exists(score_path)):
+        return False
+    score_body = deep_study.strip_dollar_in_svg_text(_body_inner(_read(score_path)))
+    block = ('<!--SCORECARD-INJECTED-->' + _sep("本篇评分卡 · Score")
+             + f'<div class="container">{score_body}</div>'
+             + '<!--/SCORECARD-INJECTED-->')
+    # 注入评分卡样式 + 中和 scorer 的 body 宽度规则（沿用组合页做法，避免整页被收窄到 660px）
+    if "</style>" in h:
+        h = h.replace("</style>", scorer.CSS +
+                      "\nbody{max-width:none;margin:0;padding:0;background:#fff}\n</style>", 1)
+    m = re.search(r'(<div class="container"[^>]*>)', h)
+    if m:
+        h = h[:m.end()] + "\n" + block + "\n" + h[m.end():]
+    else:
+        h = re.sub(r"(<body[^>]*>)", r"\1\n" + block, h, count=1)
+    with open(study_path, "w", encoding="utf-8") as f:
+        f.write(h)
+    return True
 
 
 def _hook_for(row, meta):

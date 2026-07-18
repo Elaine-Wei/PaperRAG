@@ -142,16 +142,16 @@ def freshness(published_str, today=None):
         t = (today - pub).days
     except Exception:
         return {"score": 0.0, "days": None, "label": "发表日期未知"}
-    score = 5.0 * (1 - t / FRESHNESS_WINDOW_DAYS)
-    score = max(0.0, min(5.0, score))  # t>7 → 0；未来日期 → 5
+    # sigmoid 平滑衰减（0-5 标定）：S(t)=1+4.5/(1+exp((ln2/15)(t−45)))
+    # S(0)=5.0、S(30)=4.0、S(45)=3.25、S(60)=2.5、S(90)=1.5，下限趋近 1；范围 (1,5]，无需裁剪。
+    t_eff = max(0, t)  # 未来/今天 → t=0 → S=5.0（不超过 5）
+    score = 1.0 + 4.5 / (1.0 + math.exp((math.log(2) / 15.0) * (t_eff - 45)))
     if t <= 0:
         label = "今天发布"
     elif t == 1:
         label = "1 天前"
-    elif t <= FRESHNESS_WINDOW_DAYS:
-        label = f"{t} 天前"
     else:
-        label = f"{t} 天前（已超出 {FRESHNESS_WINDOW_DAYS} 天新鲜窗口）"
+        label = f"{t} 天前"
     return {"score": round(score, 1), "days": t, "label": label}
 
 
@@ -887,8 +887,9 @@ def render_html(meta, fresh, norm, cross_notes, dom_rel=None, authority=None):
 
 <div class="card">
   <div class="dim">新鲜度 Freshness · <span class="score">{fresh['score']:.1f}</span> / 5</div>
-  <p class="reason">{esc(fresh['label'])}。由代码按发表日期计算（非 LLM）：
-  <code>score = 5·(1 − t/7)</code>，t 为距今天数，t&gt;7 记 0。该维度只衡量 7 天窗口内的新鲜度（catch-up 用途）。</p>
+  <p class="reason">{esc(fresh['label'])}。由代码按 arXiv 提交日期计算（非 LLM），sigmoid 平滑衰减：
+  <code>S(t) = 1 + 4.5 / (1 + e^((ln2/15)(t−45)))</code>，t 为距今天数；S(0)=5.0，随时间平滑下降
+  （S(30)=4.0、S(45)=3.25、S(90)=1.5），下限趋近 1。</p>
 </div>
 
 <div class="card">
@@ -928,7 +929,7 @@ def render_html(meta, fresh, norm, cross_notes, dom_rel=None, authority=None):
 
 <div class="rubric">
 <strong>评分标准（透明公开）</strong><br>
-• <strong>新鲜度</strong>：<code>5·(1 − t/7)</code>，t=距发表天数，clamp 到 0–5；7 天以上记 0。<br>
+• <strong>新鲜度</strong>：sigmoid 衰减 <code>S(t)=1+4.5/(1+e^((ln2/15)(t−45)))</code>，t=距 arXiv 提交天数；S(0)=5.0→S(45)=3.25→S(90)=1.5，范围 (1,5]，不裁剪。<br>
 • <strong>可复现性</strong>：4 子项各 0/0.5/1，权重
  开源代码 {REPRO_WEIGHTS['code_available']:.2f}、数据 {REPRO_WEIGHTS['data_obtainable']:.2f}、
  超参/配置 {REPRO_WEIGHTS['hyperparams_disclosed']:.2f}、环境 {REPRO_WEIGHTS['env_clear']:.2f}；

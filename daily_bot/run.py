@@ -966,6 +966,56 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
     return {"completed": completed, "gave_up": gave_up, "pending": pending, "log_path": log_path}
 
 
+# WeCom 链接样式：先用 markdown [文字](url)；若群里不可点，改成 "bare"（裸 URL 自动成链）
+TOP30_LINK_STYLE = "markdown"
+
+
+def _md_link(text, url):
+    return f"[{text}]({url})" if TOP30_LINK_STYLE == "markdown" else url
+
+
+def _english_shortname(title):
+    """从标题derive一个 ASCII 短名做文件名组件：冒号前若是短名(系统/方法名)用它，否则取前3词 CamelCase。"""
+    t = (title or "").strip()
+    head = re.split(r"[:：]", t, 1)[0].strip()
+    if head and len(head) <= 30 and re.search(r"[A-Za-z]", head):
+        name = re.sub(r"[^A-Za-z0-9\-]", "", head.replace(" ", ""))       # 冒号前名，紧凑
+    else:
+        words = re.sub(r"[^A-Za-z0-9\- ]", " ", t).split()
+        name = "".join(w[:1].upper() + w[1:] for w in words[:3])          # 前3词 CamelCase
+    name = re.sub(r"-{2,}", "-", name).strip("-")[:30]
+    return name or "paper"
+
+
+def _chunk_messages(header, lead_blocks, item_blocks, max_bytes=3800):
+    """把 header + lead(总览/引语) + 若干 item 块打包成尽量少的消息（每条 ≤ max_bytes）。
+    每 item 保留完整两链接；超限则开新消息，头部标『（续 k）』。返回消息字符串列表。"""
+    msgs = []
+    cur = [header] + list(lead_blocks)
+    for b in item_blocks:
+        if len("\n".join(cur + [b]).encode("utf-8")) > max_bytes and len(cur) > 1:
+            msgs.append("\n".join(cur))
+            cur = [f"{header}（续 {len(msgs) + 1}）", b]
+        else:
+            cur.append(b)
+    if cur:
+        msgs.append("\n".join(cur))
+    return msgs
+
+
+def _study_hook_zh(path):
+    """从深读 HTML 抽中文一句话（header-subtitle=Pass-1 hook）作消息里的中文简介名。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            h = f.read()
+        m = re.search(r'<p class="header-subtitle[^"]*">(.*?)</p>', h, re.S)
+        if m:
+            return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def run_top30(conn, fetch_n=30, study_top=6):
     """
     每日 Top-N 榜单模式：选最新相关 N 篇 → 真实 5 维打分（增量）→ 综评 0-10（增量）→
@@ -1007,52 +1057,91 @@ def run_top30(conn, fetch_n=30, study_top=6):
     conn = db.ensure(conn)  # 退避循环含长 sleep，之后重连
     print(f"[top30] 深读完成 {len(studied)} 篇；放弃 {len(sres['gave_up'])} 篇"
           f"（内容问题）；日志 {sres['log_path']}")
+    # 4b) 把评分卡插到每篇深读顶部（第0部分）——开门见山先看本篇 5 维雷达+综评
+    for aid in studied:
+        row = db.get_daily_row(conn, aid) or {}
+        try:
+            assemble.prepend_score_card_to_study(row.get("deep_study_path"), row.get("score_path"))
+        except Exception as e:
+            print(f"[top30][scorecard][WARN] {aid}: {e}")
     # 5) 概览
     date_str = datetime.date.today().isoformat()
     conn = db.ensure(conn)
     overview = assemble.assemble_overview(conn, ranked, studied, date_str)
     print(f"\n[top30] 概览：{overview}")
 
-    # 6) 推送：概览每天一次 + 每个深读文件一次（各自去重）
-    pushed = {"overview": False, "studies": 0, "skipped": 0, "failed": 0}
+    # 6) 交付：上传 COS（强制下载）+ 一条 markdown 链接消息（webhook 空 → 两者都跳过）
+    import cos_upload
+    pushed = {"message": False, "uploaded": 0, "failed": 0, "skipped": 0}
     if not wecom.WEBHOOK:
-        print("[top30][push][WARN] 未设置 WECOM_WEBHOOK_URL，跳过推送（文件已生成）。")
+        print("[top30][deliver][WARN] 未设置 WECOM_WEBHOOK_URL，跳过 COS 上传与推送（文件已本地生成）。")
         return {"candidates": len(ids), "ranked": ranked, "comps": comps,
                 "studied": studied, "overview_path": overview, "pushed": pushed}
     conn = db.ensure(conn)
     ov_key = f"overview_{date_str}"
     if db.top30_already_pushed(conn, ov_key):
-        print("[top30][push] 概览今日已推，跳过。")
+        print("[top30][deliver] 今日消息已推，跳过（COS 上传也跳过）。")
         pushed["skipped"] += 1
-    else:
-        ok, detail = wecom.push_file(
-            f"📊 今日 Top{len(ranked)} 论文精选 · {date_str}（附综评前 {len(studied)} 篇深读）", overview)
-        conn = db.ensure(conn)
-        db.top30_record_push(conn, ov_key, "success" if ok else "failed", str(detail)[:400])
-        pushed["overview"] = ok
-        print(f"[top30][push] 概览 -> {'成功' if ok else '失败'}：{detail}")
-        time.sleep(4)
-    for aid in studied:
-        conn = db.ensure(conn)
-        skey = f"study_{aid}"
-        if db.top30_already_pushed(conn, skey):
-            pushed["skipped"] += 1
-            continue
+        return {"candidates": len(ids), "ranked": ranked, "comps": comps,
+                "studied": studied, "overview_path": overview, "pushed": pushed}
+
+    # 概览上传（预览 + 下载 两链接）
+    lead = []
+    try:
+        ov_pv, ov_dl = cos_upload.upload_and_links(overview, f"{date_str}_Top30_overview.html")
+        pushed["uploaded"] += 1
+        lead.append(f"📄 总览（全部 Top{len(ranked)}）：{_md_link('在线预览', ov_pv)} ｜ "
+                    f"{_md_link('下载保存', ov_dl)}")
+        print(f"[top30][cos] 概览 -> paper_rag/{date_str}_Top30_overview.html")
+    except Exception as e:
+        print(f"[top30][cos][WARN] 概览上传失败：{e}")
+        pushed["failed"] += 1
+    lead.append(f"综评前 {len(studied)} 篇 · 深度精读（在线预览，或下载 HTML 永久保存）：")
+
+    # 每篇：英文标题 → 中文简介 → 两链接（预览/下载）
+    item_blocks = []
+    for aid in [a for a in ranked if a in set(studied)]:   # 按综评序
         row = db.get_daily_row(conn, aid) or {}
         sp = row.get("deep_study_path")
         if not sp or not os.path.exists(sp):
             continue
         meta = (db.get_papers(conn, [aid]) or [{}])[0]
-        ok, detail = wecom.push_file(f"📄 深读：{meta.get('title') or aid}", sp)
-        conn = db.ensure(conn)
-        db.top30_record_push(conn, skey, "success" if ok else "failed", str(detail)[:400])
-        pushed["studies"] += 1 if ok else 0
-        pushed["failed"] += 0 if ok else 1
-        print(f"[top30][push] 深读 {aid} -> {'成功' if ok else '失败'}：{detail}")
-        time.sleep(4)
+        sc = db.get_score(conn, aid) or {}
+        en = meta.get("title") or aid
+        en = en[:80] + ("…" if len(en) > 80 else "")                 # 英文标题在前
+        zh = (_study_hook_zh(sp) or (sc.get("composite_reason") or "") or "")  # 中文简介
+        obj = f"{aid}_{_english_shortname(meta.get('title'))}.html"
+        try:
+            pv, dl = cos_upload.upload_and_links(sp, obj)
+            pushed["uploaded"] += 1
+        except Exception as e:
+            print(f"[top30][cos][WARN] {aid} 上传失败：{e}")
+            pushed["failed"] += 1
+            continue
+        rank = ranked.index(aid) + 1
+        comp = sc.get("composite_score")
+        comp_txt = f" · 综评 {float(comp):.1f}/10" if comp is not None else ""
+        item_blocks.append(f"**Top{rank}** {en} ({aid}){comp_txt}\n{zh}\n"
+                           f"{_md_link('在线预览', pv)} ｜ {_md_link('下载保存', dl)}")
 
-    return {"candidates": len(ids), "ranked": ranked, "comps": comps,
-            "studied": studied, "overview_path": overview, "pushed": pushed}
+    # 打包成尽量少的消息（每条 ≤ ~3800B），逐条发送
+    header = f"📊 今日 Top{len(ranked)} 论文精选 · {date_str}"
+    msgs = _chunk_messages(header, lead, item_blocks)
+    all_ok = True
+    for i, m in enumerate(msgs, 1):
+        ok, detail = wecom.send_markdown(wecom.WEBHOOK, m)
+        all_ok = all_ok and ok
+        print(f"[top30][deliver] 消息 {i}/{len(msgs)} -> {'成功' if ok else '失败'}：{detail}")
+        if i < len(msgs):
+            time.sleep(4)   # 限流
+    conn = db.ensure(conn)
+    db.top30_record_push(conn, ov_key, "success" if all_ok else "failed",
+                         f"{len(msgs)} msg(s); uploaded={pushed['uploaded']}")
+    pushed["message"] = all_ok
+    pushed["n_messages"] = len(msgs)
+
+    return {"candidates": len(ids), "ranked": ranked, "comps": comps, "studied": studied,
+            "overview_path": overview, "messages": msgs, "pushed": pushed}
 
 
 def run_deliverables(conn, push_limit, study_limit):
@@ -1264,8 +1353,8 @@ def main():
         else:
             p = t["pushed"]
             print(f"  候选 {t['candidates']} 篇；深读 {len(t['studied'])} 篇；概览 {t['overview_path']}")
-            print(f"  推送：概览 {'成功' if p['overview'] else ('跳过' if p['skipped'] else '失败')}，"
-                  f"深读文件成功 {p['studies']}，失败 {p['failed']}，已推过跳过 {p['skipped']}。")
+            print(f"  交付：COS 上传 {p.get('uploaded', 0)} 个（失败 {p.get('failed', 0)}），"
+                  f"链接消息 {'成功' if p.get('message') else ('今日已推/跳过' if p.get('skipped') else '失败/未推')}。")
         print("\n[done] Top 榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
         conn.close()
         return
