@@ -313,6 +313,29 @@ def get_push_batch(conn, area_order, limit=500):
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
+def get_window_batch(conn, days=7):
+    """
+    滚动窗口榜单：所有【相关】且 arXiv 发表日期落在最近 days 天内的论文，按综评分降序（未评分置底）。
+    数量随窗口自然浮动（可能 20 也可能 45），不再固定 30。旧论文随窗口自然滑出。
+    返回 [{arxiv_id, area, published, composite}]。composite 为库中已存值（增量流程会补齐）。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT dp.arxiv_id, dp.area, pa.published, ds.composite_score
+            FROM daily_paper dp
+            JOIN papers pa ON pa.arxiv_id = dp.arxiv_id
+            LEFT JOIN daily_score ds ON ds.arxiv_id = dp.arxiv_id
+            WHERE dp.is_relevant IS TRUE
+              AND pa.published >= ((NOW() AT TIME ZONE 'Asia/Hong_Kong')::date - %s)
+            ORDER BY ds.composite_score DESC NULLS LAST,
+                     pa.published DESC, dp.arxiv_id DESC;
+            """, (days,))
+        return [{"arxiv_id": r[0], "area": r[1], "published": r[2],
+                 "composite": float(r[3]) if r[3] is not None else None}
+                for r in cur.fetchall()]
+
+
 def get_top30_batch(conn, limit=30):
     """当日 top-N 候选：相关论文，按最新（published 降序）取 limit 篇。不按是否推送过过滤——
     这是每日榜单，可重复生成；打分/综评/深读/推送各自增量去重。"""

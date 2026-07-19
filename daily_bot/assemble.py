@@ -177,13 +177,14 @@ def _hook_for(row, meta):
     return (abs_[:90] + "…") if len(abs_) > 90 else abs_
 
 
-def assemble_overview(conn, ids_sorted, studied_ids, date_str=None):
+def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied=None):
     """
-    组装【当日 Top-N 概览】单文件：每篇一行 = 群消息格式(format_scores) + 综评分 + 综评理由，
-    top（已精读）标 ★已精读。按传入的 ids_sorted 顺序（综评降序）呈现。返回文件路径。
+    组装【滚动窗口榜单】概览单文件：每篇一行 = 群消息格式(format_scores) + 综评分 + 综评理由，
+    按 ids_sorted（综评降序）呈现。今日新精读标 ★今日精读；此前已精读标 ✓已精读。
     """
     date_str = date_str or datetime.date.today().isoformat()
     studied = set(studied_ids or [])
+    prev = set(prev_studied or []) - studied   # 之前已精读（与今日新精读不重叠）
     metas = {m["arxiv_id"]: m for m in db.get_papers(conn, list(ids_sorted))}
 
     entries = []
@@ -198,7 +199,12 @@ def assemble_overview(conn, ids_sorted, studied_ids, date_str=None):
         comp = sc.get("composite_score") if sc else None
         creason = html.escape((sc.get("composite_reason") or "") if sc else "")
         comp_txt = f"{float(comp):.1f}/10" if comp is not None else "N/A"
-        badge = '<span class="ov-badge">★已精读</span>' if aid in studied else ""
+        if aid in studied:
+            badge = '<span class="ov-badge">★今日精读</span>'
+        elif aid in prev:
+            badge = '<span class="ov-badge" style="background:#16786a">✓已精读</span>'
+        else:
+            badge = ""
         entries.append(
             f'<div class="ov-entry">'
             f'<div class="ov-head"><span class="ov-rank">#{i}</span>📄 {title}{badge}</div>'
@@ -228,7 +234,7 @@ body{{max-width:none;margin:0;padding:0;background:#fff}}
 </style></head><body class="show-zh">
 <div class="ov-wrap">
 <h1 class="ov-title">今日精选 · Top {len(ids_sorted)}</h1>
-<div class="ov-sub">{date_str} · 按综评分（0-10）降序 · ★已精读为综评前列、已生成深度精读</div>
+<div class="ov-sub">{date_str} · 最近 7 天窗口 · 按综评分（0-10）降序 · ★今日精读 / ✓已精读</div>
 {body}
 </div>
 </body></html>

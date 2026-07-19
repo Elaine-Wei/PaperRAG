@@ -863,6 +863,16 @@ def _has_begging(path):
         return False
 
 
+def _is_study_complete(conn, aid, min_big=4):
+    """深读是否【完整】：已标记 studied + 文件存在 + n_big_sections≥min_big + 无乞讨话术。"""
+    if not db.get_stage_status(conn, aid).get("studied"):
+        return False
+    sp = (db.get_daily_row(conn, aid) or {}).get("deep_study_path")
+    if not sp or not os.path.exists(sp):
+        return False
+    return _count_big_sections(sp) >= min_big and not _has_begging(sp)
+
+
 def _classify_study_error(exc):
     """区分失败类型：relay（限流/超时，退避重试）vs content（内容问题，3 次后放弃该篇）。"""
     s = str(exc).lower()
@@ -1030,43 +1040,78 @@ def _study_hook_zh(path):
     return ""
 
 
-def run_top30(conn, fetch_n=30, study_top=6):
+def _top30_dry_run(conn, window, study_top, window_days):
+    """只读库：按已存综评排序，打印窗口/目标/标记；不打分、不精读、不推送、不调 LLM。"""
+    ranked = [w["arxiv_id"] for w in window]           # get_window_batch 已按综评降序
+    comp = {w["arxiv_id"]: w["composite"] for w in window}
+    pub = {w["arxiv_id"]: w["published"] for w in window}
+    area = {w["arxiv_id"]: w["area"] for w in window}
+    complete = {a: _is_study_complete(conn, a) for a in ranked}
+    prev_studied = [a for a in ranked if complete[a]]
+    targets = [a for a in ranked if not complete[a]][:study_top]
+
+    print("\n===== DRY-RUN 滚动窗口榜单（只读库，无 LLM/推送/精读）=====")
+    print(f"窗口 {window_days} 天，相关论文 {len(ranked)} 篇；已完整精读 {len(prev_studied)}（✓）\n")
+    print(f"(a) 窗口论文（按综评降序）：")
+    print(f"  {'#':>2}  {'arxiv_id':11} {'published':11} {'comp':>5}  {'area':7} mark")
+    for i, a in enumerate(ranked, 1):
+        c = f"{comp[a]:.1f}" if comp[a] is not None else "N/A"
+        mark = "✓已精读" if complete[a] else ("★目标" if a in targets else "")
+        print(f"  {i:>2}  {a:11} {str(pub[a]):11} {c:>5}  {str(area[a]):7} {mark}")
+    print(f"\n(b) 本轮精读目标（综评最高的未精读 {study_top} 篇，向下顺延）：")
+    for a in targets:
+        c = f"{comp[a]:.1f}" if comp[a] is not None else "N/A"
+        print(f"     {a}  composite={c}  already_complete={complete[a]}")
+    print(f"     → 目标全部未精读: {all(not complete[a] for a in targets)}  (共 {len(targets)} 篇)")
+    print(f"\n(c) 概览标记：✓已精读 = {len(prev_studied)}；★今日新精读 = {len(targets)}（若全部成功）")
+    return {"candidates": len(ranked), "prev_studied": prev_studied,
+            "targets": targets, "dry_run": True}
+
+
+def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False):
     """
-    每日 Top-N 榜单模式：选最新相关 N 篇 → 真实 5 维打分（增量）→ 综评 0-10（增量）→
-    按综评降序 → 深读前 study_top 篇（增量）→ 生成一页概览 → 推送（概览每天一次 + 各深读文件一次）。
-    5 个子分为既有 scorer 的真实结果，综评为加法层，绝不改写子分。
+    每日榜单（滚动窗口）：窗口=最近 window_days 天内所有【相关】论文（数量自然浮动，不再固定 30）→
+    真实 5 维打分（增量）→ 综评 0-10（增量）→ 按综评降序 →
+    深读【综评最高、尚未完整精读的 study_top 篇】（跳过已精读、向下顺延 → 每天保证 study_top 篇新精读）→
+    概览（已精读标 ✓、今日新精读标 ★）→ 推送。5 个子分为 scorer 真实结果，综评为加法层。
     """
     import assemble
     import wecom
     conn = db.ensure(conn)
-    batch = db.get_top30_batch(conn, fetch_n)
-    if not batch:
-        print("  无相关论文可选（先跑筛选）。")
+    window = db.get_window_batch(conn, window_days)
+    if not window:
+        print(f"  最近 {window_days} 天窗口内无相关论文。")
         return {"candidates": 0}
-    ids = [a for a, _ in batch]
-    print(f"[top30] 候选 {len(ids)} 篇（最新相关）：{', '.join(ids)}")
+    ids = [w["arxiv_id"] for w in window]
+    print(f"[top30] 窗口={window_days}天，相关论文 {len(ids)} 篇"
+          f"（发表 {min(str(w['published']) for w in window)}"
+          f"..{max(str(w['published']) for w in window)}）")
 
-    # 1) 打分（真实 5 维，含 Claude→luna→Claude 交叉复核；增量）
+    if dry_run:
+        return _top30_dry_run(conn, window, study_top, window_days)
+
+    # 1) 打分（增量） 2) 综评（增量）
     print("\n[top30] 打分（scorer.generate_score，增量）…")
     for aid in ids:
         conn, _ = _ensure_score(conn, aid)
-    # 2) 综评（读 5 子分 → 0-10 + 中文理由；增量）
     print("\n[top30] 综评（composite，增量）…")
     for aid in ids:
         conn, _ = _ensure_composite(conn, aid)
-    # 3) 排序：综评降序，N/A 置底
+    # 3) 按综评（最新读回）降序，N/A 置底
     comps = {}
     for aid in ids:
         sc = db.get_score(conn, aid)
         comps[aid] = (float(sc["composite_score"])
                       if sc and sc.get("composite_score") is not None else None)
     ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
-    print("\n[top30] 综评排序：" + " | ".join(
-        f"{a}={comps[a] if comps[a] is not None else 'N/A'}" for a in ranked))
-    # 4) 深读综评前 study_top（backoff + round-robin + 完整性门槛；无人值守，最长 5h）
-    print(f"\n[top30] 深度精读综评前 {study_top} 篇（backoff+round-robin，完整性≥4 段，最长 5h）…")
+    # 4) 精读目标 = 综评最高、尚未【完整】精读的 study_top 篇（跳过已精读，向下顺延）
+    prev_studied = [a for a in ranked if _is_study_complete(conn, a)]
+    prev_set = set(prev_studied)
+    targets = [a for a in ranked if a not in prev_set][:study_top]
+    print(f"\n[top30] 已完整精读 {len(prev_studied)} 篇（✓ 跳过）；本轮目标 {len(targets)} 篇：{', '.join(targets)}")
+    print(f"[top30] 深度精读（backoff+round-robin，完整性≥4 段，最长 5h）…")
     conn = db.ensure(conn)
-    sres = run_study_with_backoff(conn, ranked[:study_top])
+    sres = run_study_with_backoff(conn, targets)
     studied = sres["completed"]
     conn = db.ensure(conn)  # 退避循环含长 sleep，之后重连
     print(f"[top30] 深读完成 {len(studied)} 篇；放弃 {len(sres['gave_up'])} 篇"
@@ -1081,7 +1126,8 @@ def run_top30(conn, fetch_n=30, study_top=6):
     # 5) 概览
     date_str = datetime.date.today().isoformat()
     conn = db.ensure(conn)
-    overview = assemble.assemble_overview(conn, ranked, studied, date_str)
+    overview = assemble.assemble_overview(conn, ranked, studied, date_str,
+                                          prev_studied=prev_studied)
     print(f"\n[top30] 概览：{overview}")
 
     # 6) 交付：上传 COS（强制下载）+ 一条 markdown 链接消息（webhook 空 → 两者都跳过）
@@ -1321,55 +1367,62 @@ def main():
     score_limit = _arg_int("--score-limit", SCORE_LIMIT)
     study_limit = _arg_int("--study-limit", STUDY_LIMIT)
     push_limit = _arg_int("--push-limit", PUSH_LIMIT)
-    top30_mode = "--top30" in sys.argv
-    top30_fetch = _arg_int("--top30-fetch", 30)
+    top30_dry = "--top30-dry-run" in sys.argv
+    top30_mode = ("--top30" in sys.argv) or top30_dry
+    top30_fetch = _arg_int("--top30-fetch", 30)      # 保留：滚动窗口下不再用于选择，无害
     top30_study = _arg_int("--top30-study", 6)
+    top30_window = _arg_int("--top30-window", 7)      # 滚动窗口天数
 
     conn = db.get_connection()
     db.ensure_schema(conn)  # 幂等，确保表就位
 
-    # ---- Step 1: 抓取 + 入库（ingest）----
-    print("== Step 1: 抓取 + 入库（ingest）==")
-    papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
-    print(f"[fetch] 抓取 {len(papers)} 篇（去重后）")
-    new = 0
-    for p in papers:
-        db.upsert_paper(conn, p)                       # 写入共享 papers（冲突忽略）
-        if db.upsert_daily_paper(conn, p["arxiv_id"]):  # 新建 daily_paper 行（阶段时间戳全 NULL）
-            new += 1
-    print(f"[ingest] 新登记 daily_paper {new} 篇；其余 {len(papers) - new} 篇已存在（增量，跳过）")
+    # dry-run：只读库，跳过抓取(Step1)与筛选(Step2，会调 relay)，直接进榜单 dry-run
+    if not top30_dry:
+        # ---- Step 1: 抓取 + 入库（ingest）----
+        print("== Step 1: 抓取 + 入库（ingest）==")
+        papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
+        print(f"[fetch] 抓取 {len(papers)} 篇（去重后）")
+        new = 0
+        for p in papers:
+            db.upsert_paper(conn, p)                       # 写入共享 papers（冲突忽略）
+            if db.upsert_daily_paper(conn, p["arxiv_id"]):  # 新建 daily_paper 行（阶段时间戳全 NULL）
+                new += 1
+        print(f"[ingest] 新登记 daily_paper {new} 篇；其余 {len(papers) - new} 篇已存在（增量，跳过）")
 
-    # ---- Step 2: 筛选 backlog（仅未筛过的；甲→乙；结果落库）----
-    print("\n== Step 2: 筛选 backlog（甲 → 乙，仅 filtered_at IS NULL）==")
-    conn = db.ensure(conn)
-    stats = run_filter(conn)
+        # ---- Step 2: 筛选 backlog（仅未筛过的；甲→乙；结果落库）----
+        print("\n== Step 2: 筛选 backlog（甲 → 乙，仅 filtered_at IS NULL）==")
+        conn = db.ensure(conn)
+        stats = run_filter(conn)
 
-    print("\n== 筛选结果 ==")
-    if stats.get("backlog", 0) == 0:
-        print("  本轮无待筛论文（增量：backlog 为空，说明都筛过了）。")
-    elif stats.get("aborted"):
-        print("  本轮 stage-B 失败，未落库（backlog 保留）。")
-    else:
-        rel = stats["relevant_per_area"]
-        print(f"  backlog {stats['backlog']}：候选 {stats['candidates']} / 甲未命中 {stats['noncandidates']}")
-        print(f"  判定相关 {sum(rel.values())} 篇 — " + (", ".join(f"{a}:{c}" for a, c in rel.items()) or "无"))
-        print(f"  not_relevant {stats['not_relevant']}，uncertain {stats['uncertain']}")
+        print("\n== 筛选结果 ==")
+        if stats.get("backlog", 0) == 0:
+            print("  本轮无待筛论文（增量：backlog 为空，说明都筛过了）。")
+        elif stats.get("aborted"):
+            print("  本轮 stage-B 失败，未落库（backlog 保留）。")
+        else:
+            rel = stats["relevant_per_area"]
+            print(f"  backlog {stats['backlog']}：候选 {stats['candidates']} / 甲未命中 {stats['noncandidates']}")
+            print(f"  判定相关 {sum(rel.values())} 篇 — " + (", ".join(f"{a}:{c}" for a, c in rel.items()) or "无"))
+            print(f"  not_relevant {stats['not_relevant']}，uncertain {stats['uncertain']}")
 
     # ---- Step 3（模式分支）----
     if top30_mode:
-        # Top-N 榜单模式：打分 → 综评 → 排序 → 深读前 N → 概览 → 推送
-        print(f"\n== Step 3: Top-{top30_fetch} 榜单（打分→综评→排序→深读前 {top30_study}→概览→推送）==")
+        # 滚动窗口榜单模式（dry-run 只读库、不调 LLM/推送）
+        mode_txt = "DRY-RUN" if top30_dry else "打分→综评→排序→深读→概览→推送"
+        print(f"\n== Step 3: 滚动窗口榜单（{top30_window}天 · {mode_txt}）==")
         conn = db.ensure(conn)
-        t = run_top30(conn, fetch_n=top30_fetch, study_top=top30_study)
-        print("\n== Top 榜单结果 ==")
-        if t.get("candidates", 0) == 0:
-            print("  无候选（先确保有相关论文）。")
-        else:
-            p = t["pushed"]
-            print(f"  候选 {t['candidates']} 篇；深读 {len(t['studied'])} 篇；概览 {t['overview_path']}")
-            print(f"  交付：COS 上传 {p.get('uploaded', 0)} 个（失败 {p.get('failed', 0)}），"
-                  f"链接消息 {'成功' if p.get('message') else ('今日已推/跳过' if p.get('skipped') else '失败/未推')}。")
-        print("\n[done] Top 榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
+        t = run_top30(conn, fetch_n=top30_fetch, study_top=top30_study,
+                      window_days=top30_window, dry_run=top30_dry)
+        if not top30_dry:
+            print("\n== Top 榜单结果 ==")
+            if t.get("candidates", 0) == 0:
+                print("  窗口内无候选。")
+            else:
+                p = t["pushed"]
+                print(f"  窗口 {t['candidates']} 篇；今日新精读 {len(t['studied'])} 篇；概览 {t['overview_path']}")
+                print(f"  交付：COS 上传 {p.get('uploaded', 0)} 个（失败 {p.get('failed', 0)}），"
+                      f"链接消息 {'成功' if p.get('message') else ('今日已推/跳过' if p.get('skipped') else '失败/未推')}。")
+            print("\n[done] 滚动窗口榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
         conn.close()
         return
 
