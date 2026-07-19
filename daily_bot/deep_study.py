@@ -293,7 +293,53 @@ def _llm(system, user, model, temperature=0.6, max_tokens=32_000):
 # ---------------------------------------------------------------------------
 
 MAX_CHUNK_CHARS = 9_000
+MIN_BODY_CHARS = 200   # 正文短于此的块视为空壳/假节
 _SKIP_TITLE_RE = re.compile(r"^(references|bibliography|acknowledg|致谢|参考文献)", re.I)
+# 假节的乞讨话术（Pass-2 收到空壳时模型会这么回；用于丢弃 + 完整性判定）
+_BEG_RE = re.compile(r"请粘贴|请提供|暂未提供|目前只有标题|请补充|paste the|provide the (?:content|text)", re.I)
+
+
+def _looks_fake_title(title):
+    """标题像假节：纯/小数编号(0.93/2.1/.94)、全大写常量(APP_ID)、尾连字符碎片(LLM-)。"""
+    t = (title or "").strip()
+    if not t:
+        return True
+    if re.fullmatch(r"\d+(\.\d+)*", t):        # 0.93 / 2.1 / 3
+        return True
+    if re.fullmatch(r"0?\.\d+", t):            # .94
+        return True
+    if re.fullmatch(r"[A-Z0-9_]{2,}", t):      # APP_ID / LLM
+        return True
+    if t.endswith("-"):                        # LLM-
+        return True
+    return False
+
+
+def _is_fake_chunk(c):
+    """空壳/假节：正文过短 或 标题像假节。"""
+    return len((c.get("text") or "").strip()) < MIN_BODY_CHARS or _looks_fake_title(c.get("title"))
+
+
+def _merge_fakes(chunks):
+    """
+    在切块出生处清洗：丢弃 References 等；把空壳/假节（表号 0.93、常量 APP_ID、碎片 LLM-、空正文）
+    的少量文字【并入前一块】而非单独成节——既不丢内容，又不把假节送进 Pass-2 引发乞讨话术。
+    """
+    out = []
+    for c in chunks:
+        if _SKIP_TITLE_RE.match(c["title"]):
+            continue                                   # References/致谢：整块丢弃
+        if _is_fake_chunk(c):
+            if out:                                    # 并入前一真块（保留其少量正文）
+                extra = (c.get("text") or "").strip()
+                if extra:
+                    out[-1]["text"] = (out[-1]["text"].rstrip() + "\n" + extra).strip()
+            elif (c.get("text") or "").strip():        # 首块即假但有正文：暂留作种子（无处可并）
+                out.append(dict(c))
+            # 首块假且空正文：直接丢弃
+        else:
+            out.append(dict(c))
+    return out
 _NAMED_HEAD_RE = re.compile(
     r"^(abstract|introduction|related works?|background|preliminaries|"
     r"methodology|methods?|experiments?|evaluation|results?|discussion|"
@@ -493,11 +539,9 @@ def analyze_pdf(pdf_bytes):
             heads, method = rx_heads, "regex"
 
     chunks = _build_chunks(lines, heads) if _ok(heads) else []
-    # 去掉 References/致谢 等；超长块细分
+    # 出生处清洗：丢 References、把空壳/假节并入前一块（防止假节进 Pass-2）；再对超长块细分
     kept = []
-    for c in chunks:
-        if _SKIP_TITLE_RE.match(c["title"]):
-            continue
+    for c in _merge_fakes(chunks):
         kept.extend(_subdivide(c))
     if len(kept) < 3:
         return full_text, pages, None, "none"
@@ -508,13 +552,18 @@ def analyze_pdf(pdf_bytes):
 # Pass 1 / 2 / 3（指令保持极简）
 # ---------------------------------------------------------------------------
 
-def pass1_outline(meta, full_text, chunks, model):
+def pass1_outline(meta, full_text, chunks, model, enforce_all=False):
     label_list = "\n".join(f"- {c['label']}: {c['title']}" for c in chunks)
+    coverage_rule = (
+        "可以跳过不值得教的部分（例如没有实质方法/证明的附录）。\n"
+        if not enforce_all else
+        "【务必】把上面列出的【每一个】原文小节 label 都分配到某个大章节，不要遗漏任何一个 "
+        "label（这些 label 已过滤掉假节，都是有实质内容的真章节）。\n")
     system = (
         "我是刚读完大二的 STEM 学生，第一次接触这个方向，想学懂这篇论文。"
         "请规划你会怎么教我：把下面列出的「原文小节」组织成若干个大教学章节，"
         "并说明每个大章节覆盖哪些原文小节（用给定的 label）。"
-        "可以跳过不值得教的部分（例如没有实质方法/证明的附录）。\n"
+        + coverage_rule +
         "title、hook、takeaway 全部用【中文】。\n"
         '只输出 JSON：{"hook":"一句话中文副标题","takeaway":"一句话中文总结",'
         '"big_sections":[{"title":"中文大章节标题","section_labels":["1","2.1"]}]}。'
@@ -551,9 +600,18 @@ def pass2_explain(chunk, model):
         "<div class=\"box info|success|danger\">；有算法用 <div class=\"algo\">，"
         "有定理/证明用 <div class=\"theorem-block\">/<div class=\"theorem-block proof\">。\n"
         "不要输出 <h1>/<h2>、不要写任何章节编号、不要写目录、不要 markdown 代码围栏。")
+    # 守卫①：正文实质为空 → 不调 LLM（避免空壳引发乞讨话术）
+    if len((chunk.get("text") or "").strip()) < MIN_BODY_CHARS:
+        print(f"    [pass2][skip] {chunk.get('label')} 正文过短/空，跳过讲解")
+        return "", None
     user = f"这一部分的标题：{chunk['title']}\n\n内容：\n{chunk['text']}"
     content, usage = _llm(system, user, model, temperature=0.6, max_tokens=16_000)
-    return _clean_fragment(content), usage
+    frag = _clean_fragment(content)
+    # 守卫②：输出含乞讨话术（模型没拿到实质内容）→ 丢弃该块
+    if _BEG_RE.search(frag):
+        print(f"    [pass2][discard] {chunk.get('label')} 输出含乞讨话术，丢弃")
+        return "", usage
+    return frag, usage
 
 
 def pass3_connective(big_title, chunk_expls, model):
@@ -821,24 +879,41 @@ def generate_multipass(meta, full_text, pages, chunks, css, model,
     usages = []
 
     print(f"[study] Pass 1（大纲）… 结构切分方法={split_method}，原文小节 {len(chunks)} 块")
-    data, u = pass1_outline(meta, full_text, chunks, model)
-    usages.append(u)
-    hook = data.get("hook", "") or ""
-    takeaway = data.get("takeaway", "") or ""
-    bigs = data.get("big_sections") or []
-
     by_label = {c["label"]: c for c in chunks}
-    resolved, used = [], set()
-    for bs in bigs:
-        title = (bs.get("title") or "（无标题）").strip()
-        labels = [str(x).strip() for x in (bs.get("section_labels") or [])]
-        cs = []
-        for l in labels:
-            if l in by_label and l not in used:
-                cs.append(by_label[l])
-                used.add(l)
-        if cs:
-            resolved.append({"title": title, "chunks": cs})
+    total = len(chunks)
+
+    def _resolve(bigs):
+        res, us = [], set()
+        for bs in bigs:
+            title = (bs.get("title") or "（无标题）").strip()
+            cs = []
+            for l in [str(x).strip() for x in (bs.get("section_labels") or [])]:
+                if l in by_label and l not in us:
+                    cs.append(by_label[l])
+                    us.add(l)
+            if cs:
+                res.append({"title": title, "chunks": cs})
+        return res, us
+
+    # Pass-1 覆盖率守卫：假节已过滤，剩下多为真节 → 要求覆盖 ≥60%；不足则重试并强制“每个 label 都分配”，取最佳一次
+    hook = takeaway = ""
+    resolved, used, best = [], set(), None
+    for attempt in range(3):
+        data, u = pass1_outline(meta, full_text, chunks, model, enforce_all=(attempt > 0))
+        usages.append(u)
+        hook = data.get("hook", "") or hook
+        takeaway = data.get("takeaway", "") or takeaway
+        resolved, used = _resolve(data.get("big_sections") or [])
+        frac = (len(used) / total) if total else 0.0
+        print(f"[study] Pass-1 覆盖：映射 {len(used)}/{total} 小节（{frac:.0%}）"
+              + ("" if attempt == 0 else f"，第{attempt + 1}次已强制全覆盖"))
+        if best is None or len(used) > len(best[1]):
+            best = (resolved, used, hook, takeaway)
+        if resolved and frac >= 0.6:
+            break
+        if attempt < 2:
+            print("[study] Pass-1 覆盖不足 60%，重试（要求每个真节 label 都分配到某章）…")
+    resolved, used, hook, takeaway = best   # 取覆盖最好的一次
     excluded = [c["label"] for c in chunks if c["label"] not in used]
 
     # ---- 检查点：先打印 Pass-1 大纲，供人工核对 ----
@@ -882,13 +957,20 @@ def generate_multipass(meta, full_text, pages, chunks, css, model,
 
     print("[study] Pass 3（衔接：模型只写 intro/outro/过渡，正文由代码拼接）…")
     big_titles, sections_html = [], []
-    for i, bs in enumerate(resolved, 1):
-        chunk_expls = [(c["title"], c["explanation"]) for c in bs["chunks"]]
+    out_idx = 0
+    for orig_i, bs in enumerate(resolved, 1):
+        # 只保留有实质讲解的小节（被 Pass-2 守卫跳过/丢弃的空壳不进正文）；整章为空则不产出该 section
+        chunk_expls = [(c["title"], c["explanation"]) for c in bs["chunks"]
+                       if (c.get("explanation") or "").strip()]
+        if not chunk_expls:
+            print(f"    - [章] {bs['title'][:36]} 无有效讲解，跳过")
+            continue
+        out_idx += 1
         intro, outro, trans, u = pass3_connective(bs["title"], chunk_expls, model)
         usages.append(u)
         sections_html.append(
-            _assemble_big_section(i, bs["title"], chunk_expls, intro, outro, trans,
-                                  figures=figs_by_sec.get(i, [])))
+            _assemble_big_section(out_idx, bs["title"], chunk_expls, intro, outro, trans,
+                                  figures=figs_by_sec.get(orig_i, [])))  # 图按原章序取，编号连续
         big_titles.append(bs["title"])
 
     body = _build_body(meta, hook, takeaway, big_titles, sections_html)

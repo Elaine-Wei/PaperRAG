@@ -851,6 +851,18 @@ def _count_big_sections(path):
         return 0
 
 
+_STUDY_BEG_RE = re.compile(r"请粘贴|请提供|暂未提供|目前只有标题|请补充", re.I)
+
+
+def _has_begging(path):
+    """最终 HTML 若残留假节乞讨话术（请粘贴/请提供/…）→ 视为不完整。文件缺失→False。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return bool(_STUDY_BEG_RE.search(f.read()))
+    except Exception:
+        return False
+
+
 def _classify_study_error(exc):
     """区分失败类型：relay（限流/超时，退避重试）vs content（内容问题，3 次后放弃该篇）。"""
     s = str(exc).lower()
@@ -925,7 +937,8 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                 res = deep_study.generate_study(aid)
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = _count_big_sections(path) if path else 0
-                if nbig >= min_big:
+                begging = _has_begging(path) if path else False
+                if nbig >= min_big and not begging:
                     conn = db.ensure(conn)  # 循环含长 sleep，写库前重连
                     db.mark_stage(conn, aid, "deep_study", path)
                     pending.remove(aid)
@@ -933,14 +946,15 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                     consec_relay = 0  # 成功 → 退避清零
                     logln(f"round={rnd} paper={aid} attempt={att} outcome=success "
                           f"nbig={nbig} rest=0m elapsed={elapsed_m()}m")
-                else:  # 跑完但不完整（跳过正文）→ content 失败
+                else:  # 跑完但不完整（章节太少 或 残留乞讨话术）→ content 失败
                     content_fails[aid] += 1
                     tag = " -> GIVE-UP(content)" if content_fails[aid] >= max_content_attempts else ""
                     if content_fails[aid] >= max_content_attempts:
                         pending.remove(aid)
                         gave_up.append(aid)
+                    why = "begging" if begging else f"nbig={nbig}<{min_big}"
                     logln(f"round={rnd} paper={aid} attempt={content_fails[aid]} "
-                          f"outcome=incomplete nbig={nbig} rest=0m elapsed={elapsed_m()}m{tag}")
+                          f"outcome=incomplete({why}) nbig={nbig} rest=0m elapsed={elapsed_m()}m{tag}")
             except Exception as e:
                 if _classify_study_error(e) == "relay":
                     consec_relay += 1
