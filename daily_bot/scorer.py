@@ -135,17 +135,20 @@ def fetch_fulltext(meta):
 # 新鲜度（代码计算）
 # ---------------------------------------------------------------------------
 
-def freshness(published_str, today=None):
+def freshness(published_str, today=None, center=45, scale=15):
+    """
+    sigmoid 平滑衰减（0-5 标定）：S(t)=1+4.5/(1+exp((ln2/scale)(t−center)))。
+    默认 center=45, scale=15 = 每日榜单的陡峭曲线（S(0)=5、S(45)=3.25、S(90)=1.5），
+    与原实现【逐字节一致】。榜单「经典」区可传更缓的 center/scale（如 365/600）避免老论文被压到 1。
+    """
     today = today or datetime.date.today()
     try:
         pub = datetime.date.fromisoformat((published_str or "")[:10])
         t = (today - pub).days
     except Exception:
         return {"score": 0.0, "days": None, "label": "发表日期未知"}
-    # sigmoid 平滑衰减（0-5 标定）：S(t)=1+4.5/(1+exp((ln2/15)(t−45)))
-    # S(0)=5.0、S(30)=4.0、S(45)=3.25、S(60)=2.5、S(90)=1.5，下限趋近 1；范围 (1,5]，无需裁剪。
-    t_eff = max(0, t)  # 未来/今天 → t=0 → S=5.0（不超过 5）
-    score = 1.0 + 4.5 / (1.0 + math.exp((math.log(2) / 15.0) * (t_eff - 45)))
+    t_eff = max(0, t)  # 未来/今天 → t=0
+    score = 1.0 + 4.5 / (1.0 + math.exp((math.log(2) / scale) * (t_eff - center)))
     if t <= 0:
         label = "今天发布"
     elif t == 1:
@@ -955,7 +958,8 @@ def render_html(meta, fresh, norm, cross_notes, dom_rel=None, authority=None):
 # 主流程
 # ---------------------------------------------------------------------------
 
-def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL):
+def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL,
+                   fresh_center=45, fresh_scale=15, cross_model=None):
     print(f"[scorer] 取元数据 {arxiv_id} …")
     meta = fetch_metadata(arxiv_id)
     if not meta:
@@ -963,7 +967,7 @@ def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL):
     print(f"[scorer] 取全文 …")
     text = fetch_fulltext(meta)
 
-    fresh = freshness(meta.get("published"))
+    fresh = freshness(meta.get("published"), center=fresh_center, scale=fresh_scale)
     print(f"[scorer] 新鲜度（代码）：{fresh['score']} （{fresh['label']}）")
 
     print(f"[scorer] 主评分（{model}）…")
@@ -979,8 +983,9 @@ def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL):
     cross_notes = []
     if cross_check_on:
         try:
-            print(f"[scorer] 交叉复核（{CROSSCHECK_MODEL}）…")
-            critique, _ = cross_check(meta, scores_for_llm(norm), CROSSCHECK_MODEL)
+            cm = cross_model or CROSSCHECK_MODEL   # 榜单可传 sol（luna 宕机时）；默认不变=daily 一致
+            print(f"[scorer] 交叉复核（{cm}）…")
+            critique, _ = cross_check(meta, scores_for_llm(norm), cm)
             if critique:
                 print(f"[scorer] 最终裁定（{model}）…")
                 final_parsed, _ = finalize(meta, scores_for_llm(norm), critique, model)
