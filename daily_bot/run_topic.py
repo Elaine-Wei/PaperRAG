@@ -12,6 +12,7 @@ run_topic —— 一次性【主题综述榜单】编排（单一主题、单一
   python daily_bot/run_topic.py --topic selfevo --score       # 便宜重要性预排→shortlist top-N → full-score(steep)+综评→单一排名 Top-N + 深读目标
   python daily_bot/run_topic.py --topic selfevo --study       # 深读 top-N(sol+theme)→概览→COS 双链（webhook 空=只生成）
   flags: --topic X  --dry-run|--score|--study  --top-n 10  --study-top 3  --window-years 2  --refresh-pool  --webhook URL
+         --study-ids id1,id2  --model-rotation / --no-model-rotation（覆盖 STUDY_MODEL_ROTATION 常量，默认 OFF=全 sol）
 """
 
 import datetime
@@ -33,6 +34,11 @@ JUDGE_MODEL = "gpt-5.6-sol"      # keep/drop 判定 + 重要性预排
 # 主评分：本主题改用 sol。原因：fable-5 经 relay 在大评分 prompt 上持续返回空(empty-score 守卫拦截)，
 # 而 luna 宕机——sol 是唯一健康主模型。副作用：交叉复核变同族(sol 自审)，暂无异构复核（fable-5 恢复后可重评）。
 SCORE_MAIN = "gpt-5.6-sol"
+# 逐-paper（非逐-call）研究模型交替：把不同论文分摊到不同模型后端（sol-wide 抖动未必命中 terra）。
+# 每篇研究全程单一模型（风格一致），仅在论文【之间】交替；同一篇的所有 pass 用同一模型。
+# 默认【关闭】（全 sol）——terra 研究质量验证通过前保持安全态；CLI --model-rotation 可临时开启。
+MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
+STUDY_MODEL_ROTATION = False
 FOUNDATIONAL_DAYS = 365          # 锚点若早于 today-此天数 → 归入「🌱 奠基之作」不参与排名
 
 TOPIC_LABEL = {"selfevo": "Agent 自进化（自进化 / 自我改进的 LLM 智能体）"}
@@ -555,7 +561,7 @@ def _study_targets(conn, topic, study_top):
     return [r[0] for r in ranked[:study_top]]
 
 
-def study_stage(topic, study_top, top_n, webhook, override_ids=None):
+def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotation=None):
     import exp_theme_summary
     import assemble
     import cos_upload
@@ -587,6 +593,15 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None):
         except Exception:
             pass
 
+    # 逐-paper 模型：按【原始 targets 下标】定一次，重试各轮沿用同一模型（稳定、逐-paper 而非逐-call）
+    rotate_on = STUDY_MODEL_ROTATION if model_rotation is None else model_rotation
+
+    def _paper_model(i):
+        return MODEL_ROTATION[i % len(MODEL_ROTATION)] if rotate_on else STUDY_MODEL
+    paper_model = {aid: _paper_model(i) for i, aid in enumerate(targets)}
+    logln(f"模型计划（rotation={'ON' if rotate_on else 'OFF'}）："
+          + "，".join(f"{a}->{m}" for a, m in paper_model.items()))
+
     for aid in list(pending):
         sc = _get_score(conn, topic, aid) or {}
         sp = sc.get("study_path")
@@ -601,15 +616,16 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None):
         for aid in list(pending):
             if (CAP - (time.time() - start)) <= 0:
                 break
+            model = paper_model.get(aid, STUDY_MODEL)   # 该论文全程单一模型（含 theme-summary）
             try:
-                res = deep_study.generate_study(aid, model=STUDY_MODEL)
+                res = deep_study.generate_study(aid, model=model)
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = run._count_big_sections(path) if path else 0
                 begging = run._has_begging(path) if path else False
                 if nbig >= 4 and not begging:
                     themed = None
                     try:
-                        tr = exp_theme_summary.generate_theme_study(aid, model=STUDY_MODEL)
+                        tr = exp_theme_summary.generate_theme_study(aid, model=model)
                         themed = tr.get("path") if isinstance(tr, dict) else None
                     except Exception as e:
                         logln(f"paper={aid} theme-summary 失败（{str(e)[:50]}），仅用 per-section 深读")
@@ -780,6 +796,12 @@ def main():
     refresh = "--refresh-pool" in args
     webhook = _args("--webhook", "").strip()
     override_ids = [x.strip() for x in _args("--study-ids", "").split(",") if x.strip()] or None
+    # 模型轮换开关：显式 CLI 覆盖模块常量 STUDY_MODEL_ROTATION；都没给则用常量
+    model_rotation = None
+    if "--no-model-rotation" in args:
+        model_rotation = False
+    elif "--model-rotation" in args:
+        model_rotation = True
 
     conn = db.get_connection()
     if "--dry-run" in args:
@@ -787,7 +809,7 @@ def main():
     elif "--score" in args:
         score_stage(topic, top_n, study_top, window_years, refresh, shortlist_top)
     elif "--study" in args:
-        study_stage(topic, study_top, top_n, webhook, override_ids)
+        study_stage(topic, study_top, top_n, webhook, override_ids, model_rotation)
     else:
         print("请指定阶段：--dry-run（池+判定）| --score（评分+排名）| --study（深读+概览+COS）")
 

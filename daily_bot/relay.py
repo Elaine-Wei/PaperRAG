@@ -2,16 +2,17 @@
 relay —— 与 OpenAI 兼容 relay 的通用调用（供 digest 与 stage-B 共用，避免重复/循环依赖）。
 
 配置从环境变量读取（daily_bot/.env 里的 RELAY_API_KEY 等，由 run.py 在启动时加载）：
-  RELAY_API_KEY（必需，=A）、RELAY_API_KEY_2（可选，=B）、
+  RELAY_API_KEY（必需，=A）、RELAY_API_KEY_2（可选，=B）、RELAY_API_KEY_3（可选，=C）、
   RELAY_BASE_URL（默认 a6）、RELAY_MODEL（默认 claude-fable-5）。
 env 在调用时读取（而非 import 时），确保 .env 已被 run.py 加载。
 
-双 key 负载均衡（RELAY_API_KEY_2 存在时启用；两把 key 在同一 relay 上各有独立的按-key 限流）：
-  ·主动轮询（主机制）：相邻 relay_chat 调用交替用 A/B，把负载~50/50 摊开，两把都远离各自限流。
-  ·失败切换（安全网）：某次调用遇 503/429/连接类错误 → 抖动 2-3s 后立刻用另一把 key 重试同一调用。
-  ·按-key 冷却（让被限的那把歇会儿）：某 key 抛 503/429 → 标记冷却 120s，其间优先路由到另一把。
+多 key（最多 3 把）负载均衡（RELAY_API_KEY_2/_3 存在时启用；每把 key 在同一 relay 上各有独立的按-key 限流）：
+  ·主动轮询（主机制）：相邻 relay_chat 调用轮流用 A/B/C，把负载 ~1/n 摊开，各把都远离各自限流。
+  ·失败切换（安全网）：某次调用遇 503/429/连接类错误 → 抖动 2-3s 后立刻用下一把 key 重试同一调用，循环所有 key。
+  ·按-key 冷却（让被限的那把歇会儿）：某 key 抛 503/429 → 标记冷却 120s，其间优先路由到未冷却的 key。
   ·只有 503/429/连接级错误触发切换/冷却；400/内容类错误立即抛出、不切换。
-  ·RELAY_API_KEY_2 未设置 → 单 key，行为与从前逐字节一致（无切换/冷却/日志、异常与返回形状不变）。
+  ·仅当【所有】可用 key 在同一次调用里都失败才抛出（疑似账号/IP 级或 relay-wide 抖动，轮换无法缓解）。
+  ·RELAY_API_KEY_2/_3 均未设置 → 单 key，行为与从前逐字节一致（无切换/冷却/日志、异常与返回形状不变）。
 """
 
 import http.client
@@ -33,8 +34,8 @@ _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
 # 模块级状态（这些 runner 都是单线程顺序调用，无需加锁；进程内存活，长跑中持续轮询）
 _next = 0                              # 轮询计数器：每次 relay_chat +1
-_cooldown = {"A": 0.0, "B": 0.0}       # label -> 冷却截止的 unix 时间
-_served = {"A": 0, "B": 0}             # 累计各 key 服务次数（用于观察 ~50/50 分流）
+_cooldown = {}                         # label -> 冷却截止的 unix 时间（按需填充，支持任意把数）
+_served = {}                           # label -> 累计服务次数（用于观察 ~1/n 分流）
 
 
 def _base_url():
@@ -46,14 +47,15 @@ def _model():
 
 
 def _keys():
-    """返回 [("A", keyA)]（单 key）或 [("A", keyA), ("B", keyB)]（双 key）。无 A → 抛错。"""
+    """返回 [("A",kA)]（单）/ [...("B",kB)]（双）/ [...("C",kC)]（三）。无 A → 抛错。"""
     a = os.environ.get("RELAY_API_KEY")
     if not a:
         raise RuntimeError("环境变量 RELAY_API_KEY 未设置")
     keys = [("A", a)]
-    b = os.environ.get("RELAY_API_KEY_2")
-    if b:
-        keys.append(("B", b))
+    for label, env in (("B", "RELAY_API_KEY_2"), ("C", "RELAY_API_KEY_3")):
+        v = os.environ.get(env)
+        if v:
+            keys.append((label, v))
     return keys
 
 
@@ -115,25 +117,25 @@ def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90,
     max_tokens：可选，限制/放开输出长度（深度精读需要很长输出时传大值）。
     model：可选，覆盖默认模型（用于按模型切换，如 claude-fable-5 / gpt-5.6-luna）。
 
-    双 key 存在时：主动轮询 A/B + 失败切换 + 120s 冷却（见模块 docstring）。
+    多 key（2/3 把）存在时：主动轮询 + 失败切换 + 120s 冷却（见模块 docstring）。
     单 key 时：仅尝试一次，异常/返回与从前逐字节一致（无切换/冷却/日志）。
     """
     global _next
     keys = _keys()
     base_url, env_model = _base_url(), _model()
     model = model or env_model
-    two = len(keys) == 2
+    n = len(keys)
+    multi = n > 1
 
-    if two:
-        i0 = _next % 2
+    if multi:
+        start = _next % n
         _next += 1
-        primary, other = keys[i0], keys[1 - i0]
+        rotated = keys[start:] + keys[:start]      # 轮询：主选在前，其余按序其后
         now = time.time()
-        # 冷却路由：主选正在冷却而另一把没冷却 → 换过去，让被限的那把歇着
-        if _cooldown[primary[0]] > now and _cooldown[other[0]] <= now:
-            order = [other, primary]
-        else:
-            order = [primary, other]
+        # 冷却路由：未冷却的排前面（保持轮询序），冷却中的沉底、仅在其余都失败时兜底尝试
+        non_cooling = [k for k in rotated if _cooldown.get(k[0], 0.0) <= now]
+        cooling = [k for k in rotated if _cooldown.get(k[0], 0.0) > now]
+        order = non_cooling + cooling
     else:
         order = keys  # 单 key：仅此一把
 
@@ -141,26 +143,26 @@ def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90,
         try:
             content, usage = _call(key, base_url, model, system_prompt, user_prompt,
                                    temperature, timeout, max_tokens)
-            if two:
-                _served[label] += 1
-                _log(f"key={label} (A:{_served['A']} B:{_served['B']})"
-                     + (" [failover]" if idx > 0 else ""))
+            if multi:
+                _served[label] = _served.get(label, 0) + 1
+                tally = " ".join(f"{lbl}:{_served.get(lbl, 0)}" for lbl, _ in keys)
+                _log(f"key={label} ({tally})" + (" [failover]" if idx > 0 else ""))
             return content, usage
         except Exception as e:
             if not _is_retryable(e):
                 raise                      # 400/内容类：立即抛，不切换、不冷却
             has_more = idx < len(order) - 1
-            if two:
+            if multi:
                 _cooldown[label] = time.time() + COOLDOWN_S
                 if has_more:
-                    _log(f"key={label} 可重试错误({_errbrief(e)}) → 冷却 {COOLDOWN_S}s，切到另一把 key")
+                    _log(f"key={label} 可重试错误({_errbrief(e)}) → 冷却 {COOLDOWN_S}s，切到下一把 key")
                 else:
-                    _log(f"key={label} 可重试错误({_errbrief(e)}) → 两把 key 均失败；"
-                         f"疑似账号/IP 级限流（同 relay 轮换无法缓解），抛出交上游退避")
+                    _log(f"key={label} 可重试错误({_errbrief(e)}) → {n} 把 key 全部失败；"
+                         f"疑似账号/IP 级或 relay-wide 限流/连接抖动（同 relay 轮换无法缓解），抛出交上游退避")
             if has_more:
-                time.sleep(2 + random.random())   # 2-3s 抖动后切换另一把
+                time.sleep(2 + random.random())   # 2-3s 抖动后切换下一把
                 continue
-            raise                          # 单 key 首次失败 / 双 key 均失败 → 抛出（上游退避处理）
+            raise                          # 单 key 首次失败 / 多 key 全失败 → 抛出（上游退避处理）
 
 
 def extract_json(text):
