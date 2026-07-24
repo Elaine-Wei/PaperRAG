@@ -32,6 +32,11 @@ DEFAULT_BASE_URL = "https://a6.a6api.com/v1"
 COOLDOWN_S = 120                       # 某 key 抛 503/429 后冷却时长（其间优先另一把）
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
+
+class RelayResponseError(RuntimeError):
+    """响应畸形/空（无 choices[0].message.content）——如某模型当前返回坏包。
+    视作可重试：先在多 key 间切换，全部失败再抛，交上游退避/跳过；不再抛裸 KeyError。"""
+
 # 模块级状态（这些 runner 都是单线程顺序调用，无需加锁；进程内存活，长跑中持续轮询）
 _next = 0                              # 轮询计数器：每次 relay_chat +1
 _cooldown = {}                         # label -> 冷却截止的 unix 时间（按需填充，支持任意把数）
@@ -65,10 +70,10 @@ def _relay_config():
 
 
 def _is_retryable(exc):
-    """只有 503/429 与连接级错误（超时/EOF/reset/握手）才触发切换+冷却；400/内容类不触发。"""
+    """503/429、连接级错误（超时/EOF/reset/握手）、以及畸形/空响应 → 触发切换+冷却；400/内容类不触发。"""
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in _RETRYABLE_HTTP
-    return isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout,
+    return isinstance(exc, (RelayResponseError, urllib.error.URLError, TimeoutError, socket.timeout,
                             ConnectionError, http.client.IncompleteRead,
                             http.client.RemoteDisconnected, ssl.SSLError))
 
@@ -104,7 +109,15 @@ def _call(api_key, base_url, model, system_prompt, user_prompt, temperature, tim
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read())
-    content = payload["choices"][0]["message"]["content"]
+    # 防御：某模型可能返回缺 content 的畸形/空包（曾致 relay.py 抛裸 KeyError('content')）。
+    # 统一转成可重试的 RelayResponseError → 先跨 key 切换，全失败再抛，交上游退避/跳过。
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        content = None
+    if not content:
+        snippet = json.dumps(payload, ensure_ascii=False)[:200]
+        raise RelayResponseError(f"模型 {model} 返回空/畸形响应（无 content）：{snippet}")
     usage = payload.get("usage")  # OpenAI 格式：prompt/completion/total_tokens
     return content, usage
 

@@ -75,6 +75,12 @@ RELAY_API_KEY = os.environ.get("RELAY_API_KEY")
 RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", relay.DEFAULT_BASE_URL)
 RELAY_MODEL = os.environ.get("RELAY_MODEL", relay.DEFAULT_MODEL)
 
+# 逐-paper（非逐-call）研究模型交替（与 run_topic.py 同机制）：每篇深读全程单一模型
+# （outline+sections+theme 同一模型），仅在论文【之间】按稳定下标交替；跨 backoff 重试稳定。
+# 默认【关闭】=全 sol（安全已验证态）；--model-rotation 可临时开启 sol↔terra 摊负载。
+MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
+STUDY_MODEL_ROTATION = False
+
 # arXiv
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 ARXIV_DELAY = 3.0  # arXiv 要求请求间隔 ≥ 3 秒
@@ -883,7 +889,7 @@ def _classify_study_error(exc):
 
 def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                            backoff_min=(10, 15, 20, 25, 30),
-                           min_big=4, max_content_attempts=3):
+                           min_big=4, max_content_attempts=3, model_rotation=None):
     """
     无人值守地把 target_ids（综评前 N 篇）跑成【完整】深读，扛住 relay 503 限流：
       - 逐篇跑，跑完查完整性：n_big_sections >= min_big 才算成功（1-2 段=跳过正文=失败）。
@@ -922,6 +928,13 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
     completed, gave_up = [], []
     consec_relay = 0
 
+    # 逐-paper 模型：按【原始 target_ids 下标】定一次，跨 backoff 各轮沿用（稳定、逐-paper 而非逐-call）
+    rotate_on = STUDY_MODEL_ROTATION if model_rotation is None else model_rotation
+
+    def _paper_model(i):
+        return MODEL_ROTATION[i % len(MODEL_ROTATION)] if rotate_on else deep_study.DEFAULT_MODEL
+    paper_model = {aid: _paper_model(i) for i, aid in enumerate(target_ids)}
+
     # 增量：已完整的直接算完成（断点续跑）
     for aid in list(pending):
         row = db.get_daily_row(conn, aid) or {}
@@ -933,7 +946,9 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
             logln(f"paper={aid} outcome=already-complete nbig={_count_big_sections(sp)}")
 
     logln(f"START targets={list(target_ids)} to-do={pending} cap={cap_hours}h "
-          f"min_big={min_big} backoff={list(backoff_min)}min")
+          f"min_big={min_big} backoff={list(backoff_min)}min "
+          f"model_rotation={'ON' if rotate_on else 'OFF'} "
+          f"models={{" + ', '.join(f'{a}:{m}' for a, m in paper_model.items()) + '}')
 
     rnd = 0
     while pending and remaining() > 0:
@@ -944,7 +959,7 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                 break
             att = content_fails[aid] + 1
             try:
-                res = deep_study.generate_study(aid)
+                res = deep_study.generate_study(aid, model=paper_model.get(aid, deep_study.DEFAULT_MODEL))
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = _count_big_sections(path) if path else 0
                 begging = _has_begging(path) if path else False
@@ -1068,7 +1083,7 @@ def _top30_dry_run(conn, window, study_top, window_days):
             "targets": targets, "dry_run": True}
 
 
-def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False):
+def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False, model_rotation=None):
     """
     每日榜单（滚动窗口）：窗口=最近 window_days 天内所有【相关】论文（数量自然浮动，不再固定 30）→
     真实 5 维打分（增量）→ 综评 0-10（增量）→ 按综评降序 →
@@ -1111,7 +1126,7 @@ def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False):
     print(f"\n[top30] 已完整精读 {len(prev_studied)} 篇（✓ 跳过）；本轮目标 {len(targets)} 篇：{', '.join(targets)}")
     print(f"[top30] 深度精读（backoff+round-robin，完整性≥4 段，最长 5h）…")
     conn = db.ensure(conn)
-    sres = run_study_with_backoff(conn, targets)
+    sres = run_study_with_backoff(conn, targets, model_rotation=model_rotation)
     studied = sres["completed"]
     conn = db.ensure(conn)  # 退避循环含长 sleep，之后重连
     print(f"[top30] 深读完成 {len(studied)} 篇；放弃 {len(sres['gave_up'])} 篇"
@@ -1372,6 +1387,12 @@ def main():
     top30_fetch = _arg_int("--top30-fetch", 30)      # 保留：滚动窗口下不再用于选择，无害
     top30_study = _arg_int("--top30-study", 6)
     top30_window = _arg_int("--top30-window", 7)      # 滚动窗口天数
+    # 模型轮换开关：显式 CLI 覆盖模块常量 STUDY_MODEL_ROTATION；都没给则用常量（默认 OFF=全 sol）
+    model_rotation = None
+    if "--no-model-rotation" in sys.argv:
+        model_rotation = False
+    elif "--model-rotation" in sys.argv:
+        model_rotation = True
 
     conn = db.get_connection()
     db.ensure_schema(conn)  # 幂等，确保表就位
@@ -1412,7 +1433,8 @@ def main():
         print(f"\n== Step 3: 滚动窗口榜单（{top30_window}天 · {mode_txt}）==")
         conn = db.ensure(conn)
         t = run_top30(conn, fetch_n=top30_fetch, study_top=top30_study,
-                      window_days=top30_window, dry_run=top30_dry)
+                      window_days=top30_window, dry_run=top30_dry,
+                      model_rotation=model_rotation)
         if not top30_dry:
             print("\n== Top 榜单结果 ==")
             if t.get("candidates", 0) == 0:

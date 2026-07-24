@@ -46,7 +46,7 @@ MAX_TEXT_CHARS = 600_000
 
 # 模型：默认 gpt-5.6-luna（须能完整生成长的多趟输出而不被 relay 静默截断；
 # claude-fable-5 在长输出时会被截断）。可用第二个位置参数 / 环境变量 DEEP_STUDY_MODEL 覆盖切换。
-DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_MODEL = "gpt-5.6-sol"   # 深读默认模型（luna 返回坏包 → 改 sol；luna 确认健康前仅显式 opt-in）
 
 # 输出上限：深度精读很长，放开到 60k。不同模型的实际上限可能不同——
 # 若模型拒绝过大的 max_tokens（HTTP 400），按 OUTPUT_TOKENS_LADDER 自动降档重试。
