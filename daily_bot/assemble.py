@@ -187,8 +187,18 @@ def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied
     prev = set(prev_studied or []) - studied   # 之前已精读（与今日新精读不重叠）
     metas = {m["arxiv_id"]: m for m in db.get_papers(conn, list(ids_sorted))}
 
+    # 名为 top30：完整排名留在 DB，但【交付的概览只展示前 30】。
+    # 例外：已精读的论文（今日★/此前✓）即使排名在 30 名外也保留其条目（不丢深读链接/徽标），排名号仍为真实名次。
+    DISPLAY_CAP = 30
+    total = len(ids_sorted)
+    shown = min(DISPLAY_CAP, total)
+    extra_studied = [a for i, a in enumerate(ids_sorted, 1)
+                     if i > DISPLAY_CAP and (a in studied or a in prev)]
+
     entries = []
     for i, aid in enumerate(ids_sorted, 1):
+        if i > DISPLAY_CAP and not (aid in studied or aid in prev):
+            continue   # 30 名外且非精读 → 不进概览（但仍在 DB 完整排名里）
         meta = metas.get(aid, {"arxiv_id": aid, "title": aid})
         row = db.get_daily_row(conn, aid) or {}
         sc = db.get_score(conn, aid)
@@ -221,7 +231,7 @@ def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied
     doc = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>今日精选 · Top {len(ids_sorted)} · {date_str}</title>
+<title>今日精选 · Top {shown} · {date_str}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Libre+Baskerville:ital,wght@0,700;1,400&family=Noto+Sans+SC:wght@400;700&family=Noto+Serif+SC:wght@700&family=Source+Sans+3:wght@400;700&display=swap" rel="stylesheet">
@@ -233,8 +243,8 @@ def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied
 body{{max-width:none;margin:0;padding:0;background:#fff}}
 </style></head><body class="show-zh">
 <div class="ov-wrap">
-<h1 class="ov-title">今日精选 · Top {len(ids_sorted)}</h1>
-<div class="ov-sub">{date_str} · 最近 7 天窗口 · 按综评分（0-10）降序 · ★今日精读 / ✓已精读</div>
+<h1 class="ov-title">今日精选 · Top {shown}</h1>
+<div class="ov-sub">{date_str} · 最近 7 天窗口（共 {total} 篇入窗，展示前 {shown}{('，另含 ' + str(len(extra_studied)) + ' 篇 30 名外已精读') if extra_studied else ''}）· 按综评分（0-10）降序 · ★今日精读 / ✓已精读</div>
 {body}
 </div>
 </body></html>
