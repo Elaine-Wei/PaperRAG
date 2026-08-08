@@ -32,6 +32,10 @@ DEFAULT_BASE_URL = "https://a6.a6api.com/v1"
 COOLDOWN_S = 120                       # 某 key 抛 503/429 后冷却时长（其间优先另一把）
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
+# 必须显式带 UA：relay 前置的 Cloudflare 会以 error 1010 封掉 urllib 默认的
+# "Python-urllib/3.x"（403，且不可重试 → 会把整轮评分全判 FAIL）。任意常规 UA 均可放行。
+_USER_AGENT = "PaperRAG-daily_bot/1.0"
+
 
 class RelayResponseError(RuntimeError):
     """响应畸形/空（无 choices[0].message.content）——如某模型当前返回坏包。
@@ -104,6 +108,7 @@ def _call(api_key, base_url, model, system_prompt, user_prompt, temperature, tim
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": _USER_AGENT,
         },
         method="POST",
     )
