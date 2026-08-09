@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+DS 直连兜底 —— 离线测试（不联网、不连库、不碰 .env 真值）。
+
+覆盖：
+  1  relay 未耗尽时【不】调 DS
+  2  content 用尽 → DS 恰好调一次；成功 → 完成 + 模型标签 ds-direct
+  3  DS 也失败 → 按原逻辑 gave_up，且 DS 只调一次（不重复烧）
+  4  DS_API_KEY 未设置 → DS 从不被调用，行为与从前一致
+  5  relay 类失败达阈值 → 转 DS（524 场景：content 额度永远用不完，必须靠这条）
+  6  524 归类为 relay（回归：此前被判 content，直接吃掉 3 次放弃额度）
+  7  checkpoint / 输出名按 ds-direct 命名，且与 relay 档互不污染
+  8  relay_chat(model=ds-direct) 走直连、不碰 relay key；DS 预算放大（推理模型吃 max_tokens）
+  9  评分兜底：relay 失败 → DS 出分，model_used/DB model 列 = ds-direct
+ 10  综评跟随同一模型（否则 DS 兜底会被最后一步的 relay 调用打回）
+
+跑法：python daily_bot/test_ds_fallback.py
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+FAILED = []
+PASSED = []
+
+
+def check(name, cond, detail=""):
+    (PASSED if cond else FAILED).append(name)
+    print(f"  {'✓' if cond else '✗'} {name}" + (f"   — {detail}" if detail and not cond else ""))
+
+
+class Env:
+    """临时改 os.environ，退出时还原（绝不写 .env）。"""
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.old = {}
+
+    def __enter__(self):
+        for k, v in self.kw.items():
+            self.old[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return self
+
+    def __exit__(self, *a):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+# 假 conn / 假 db：study 循环里的落库全部拦下来，不碰真库
+# ---------------------------------------------------------------------------
+class FakeCursor:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sink.append((" ".join(sql.split()), params))
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class FakeConn:
+    def __init__(self):
+        self.sql = []
+
+    def cursor(self):
+        return FakeCursor(self.sql)
+
+    def commit(self):
+        pass
+
+
+def main():
+    import relay
+    import run
+    import deep_study
+    import scorer
+
+    print("\n=== 1-8 relay/DS 分派 + 预算 + 命名 ===")
+
+    # --- 8. relay_chat(model=ds-direct) 直连、不碰 relay key；预算放大 ---
+    seen = {}
+
+    def fake_call(api_key, base_url, model, sysp, usrp, temp, timeout, max_tokens):
+        seen.update(key=api_key, base=base_url, model=model, max_tokens=max_tokens, timeout=timeout)
+        return "ok", {"total_tokens": 1}
+
+    orig_call = relay._call
+    relay._call = fake_call
+    try:
+        with Env(DS_API_KEY="sk-test", DS_BASE_URL="https://ds.test/v1", DS_MODEL="deepseek-v4-flash",
+                 RELAY_API_KEY=None, RELAY_API_KEY_2=None, RELAY_API_KEY_3=None):
+            # relay key 全部缺失也必须能走 DS（兜底的意义就在 relay 不可用时）
+            content, _ = relay.relay_chat("s", "u", model=relay.DS_MODEL_TAG, max_tokens=220)
+            check("8a relay_chat(ds-direct) 在无 relay key 时仍可用", content == "ok")
+            check("8b 打到 DS base_url", seen.get("base") == "https://ds.test/v1", seen.get("base"))
+            check("8c 用 DS 真实模型名而非标签", seen.get("model") == "deepseek-v4-flash", seen.get("model"))
+            check("8d 用 DS key", seen.get("key") == "sk-test")
+            check("8e max_tokens 放大（220 → ≥2048，推理模型与正文共用预算）",
+                  seen.get("max_tokens") >= 2048, str(seen.get("max_tokens")))
+            check("8f timeout 至少 DS 默认（冷启动实测 165s）",
+                  seen.get("timeout") >= relay.DS_DEFAULT_TIMEOUT, str(seen.get("timeout")))
+
+        with Env(DS_API_KEY=None):
+            check("8g DS_API_KEY 未设置 → ds_enabled() 为 False", relay.ds_enabled() is False)
+            try:
+                relay.relay_chat_ds("s", "u")
+                check("8h 未设置 key 时 relay_chat_ds 抛错", False, "没抛")
+            except RuntimeError:
+                check("8h 未设置 key 时 relay_chat_ds 抛 RuntimeError", True)
+    finally:
+        relay._call = orig_call
+
+    # --- 6. 524 归类回归 ---
+    check("6a 524 判为 relay 类（回归：此前被判 content）",
+          run._classify_study_error(Exception("HTTP Error 524: <none>")) == "relay")
+    check("6b 503 仍是 relay 类", run._classify_study_error(Exception("HTTP Error 503")) == "relay")
+    check("6c 400 仍是 content 类", run._classify_study_error(Exception("HTTP Error 400: bad")) == "content")
+
+    # --- 7. checkpoint / 输出命名 ---
+    cp_relay = deep_study._cp_path("2512.04697", "gpt-5.6-sol")
+    cp_ds = deep_study._cp_path("2512.04697", relay.DS_MODEL_TAG)
+    check("7a DS checkpoint 命名为 _ds-direct.json", cp_ds.endswith("2512.04697_ds-direct.json"), cp_ds)
+    check("7b 与 relay 档不同名（不互相污染）", cp_relay != cp_ds)
+    check("7c 与 relay 代理的 deepseek-v4-pro 档也不同名",
+          cp_ds != deep_study._cp_path("2512.04697", "deepseek-v4-pro"))
+
+    # ---------------------------------------------------------------------
+    # 2-5 深读循环：mock deep_study.generate_study，按模型决定成功/失败
+    # ---------------------------------------------------------------------
+    print("\n=== 2-5 深读循环：兜底时机 ===")
+
+    def run_loop(relay_mode, ds_ok, ds_key="sk-test", targets=("AAA",)):
+        """relay_mode: 'content'(产出不完整) | 'relay-exc'(抛 524)。返回 (结果, 调用轨迹)。"""
+        calls = []
+
+        def fake_generate_study(aid, model=None):
+            calls.append(model)
+            if model == relay.DS_MODEL_TAG:
+                if ds_ok:
+                    return {"path": f"/tmp/{aid}_ds.html"}
+                raise RuntimeError("DS down")
+            if relay_mode == "relay-exc":
+                raise RuntimeError("HTTP Error 524: <none>")
+            return {"path": f"/tmp/{aid}_relay.html"}   # 产出但不完整（见 _count_big_sections）
+
+        def fake_count(path):
+            return 9 if (path or "").endswith("_ds.html") else 1   # relay 产出恒不完整
+
+        marks = []
+        orig = (deep_study.generate_study, run._count_big_sections, run._has_begging,
+                run.db.ensure, run.db.mark_stage, run.db.get_daily_row, run.db.get_stage_status)
+        deep_study.generate_study = fake_generate_study
+        run._count_big_sections = fake_count
+        run._has_begging = lambda p: False
+        run.db.ensure = lambda c: c
+        run.db.mark_stage = lambda c, a, s, p: marks.append((a, s, p))
+        run.db.get_daily_row = lambda c, a: {}
+        run.db.get_stage_status = lambda c, a: {"studied": False}
+        try:
+            with Env(DS_API_KEY=ds_key):
+                res = run.run_study_with_backoff(
+                    FakeConn(), list(targets), cap_hours=0.02,
+                    backoff_min=(0, 0, 0, 0, 0), min_big=4, max_content_attempts=3)
+        finally:
+            (deep_study.generate_study, run._count_big_sections, run._has_begging,
+             run.db.ensure, run.db.mark_stage, run.db.get_daily_row,
+             run.db.get_stage_status) = orig
+        return res, calls, marks
+
+    # 2. content 用尽 → DS 一次 → 成功
+    res, calls, marks = run_loop("content", ds_ok=True)
+    ds_calls = [c for c in calls if c == relay.DS_MODEL_TAG]
+    check("1  relay 未耗尽前不调 DS（前 2 次尝试均为 relay 模型）",
+          calls[:2] and all(c != relay.DS_MODEL_TAG for c in calls[:2]), str(calls[:3]))
+    check("2a content 用尽后 DS 恰好被调 1 次", len(ds_calls) == 1, str(calls))
+    check("2b DS 成功 → 计入 completed", res["completed"] == ["AAA"], str(res["completed"]))
+    check("2c DS 成功 → 不在 gave_up", res["gave_up"] == [], str(res["gave_up"]))
+    check("2d 落库路径为 DS 产出", marks and marks[-1][2].endswith("_ds.html"), str(marks))
+
+    # 3. DS 也失败 → gave_up，且 DS 只调一次
+    res, calls, marks = run_loop("content", ds_ok=False)
+    ds_calls = [c for c in calls if c == relay.DS_MODEL_TAG]
+    check("3a DS 失败 → gave_up 与从前一致", res["gave_up"] == ["AAA"], str(res))
+    check("3b DS 失败也只调 1 次（不重复烧）", len(ds_calls) == 1, str(calls))
+    check("3c 未落库", marks == [], str(marks))
+
+    # 4. DS_API_KEY 未设置 → 完全不调 DS
+    res, calls, marks = run_loop("content", ds_ok=True, ds_key=None)
+    check("4a 未武装时 DS 从不被调用", all(c != relay.DS_MODEL_TAG for c in calls), str(calls))
+    check("4b 行为与从前一致（gave_up）", res["gave_up"] == ["AAA"], str(res))
+
+    # 5. relay 类失败（524）达阈值 → 转 DS。content 额度在这条路上永远用不完。
+    res, calls, marks = run_loop("relay-exc", ds_ok=True)
+    ds_calls = [c for c in calls if c == relay.DS_MODEL_TAG]
+    check("5a 524 连续失败达阈值 → 转 DS", len(ds_calls) == 1, str(calls))
+    check("5b 转 DS 后完成（否则会一路退避到 5h cap）", res["completed"] == ["AAA"], str(res))
+    check(f"5c 阈值 = DS_AFTER_RELAY_FAILS ({run.DS_AFTER_RELAY_FAILS})",
+          len([c for c in calls if c != relay.DS_MODEL_TAG]) == run.DS_AFTER_RELAY_FAILS, str(calls))
+
+    # ---------------------------------------------------------------------
+    # 9-10 评分兜底
+    # ---------------------------------------------------------------------
+    print("\n=== 9-10 评分兜底 + 综评模型跟随 ===")
+
+    gs_calls, gc_calls = [], []
+
+    def fake_generate_score(aid, cross_check_on=True, model=None, cross_model=None, **kw):
+        gs_calls.append((model, cross_model))
+        if model != relay.DS_MODEL_TAG:
+            raise RuntimeError("HTTP Error 524: <none>")   # relay 死掉
+        return {"meta": {"title": "t", "categories": []},
+                "fresh": {"score": 3.0, "days": 10, "label": "x"},
+                "norm": {"paper_type": "application", "repro_subs": {}, "novelty_subs": {},
+                         "repro_overall": "", "novelty_overall": "", "domain": "q-fin"},
+                "repro_total": 3.0, "novelty_total": 3.0, "domain_relevance": {"score": 5.0},
+                "authority": {"na": True}, "cross_notes": [], "path": "/tmp/s.html",
+                "cross_check": True, "model_used": model}
+
+    def fake_generate_composite(meta, sub, cross_check_on=False, model=None):
+        gc_calls.append(model)
+        if model != relay.DS_MODEL_TAG:
+            raise RuntimeError("HTTP Error 524: <none>")
+        return {"score": 7.0, "reason": "ok", "na": False}
+
+    orig_gs, orig_gc = scorer.generate_score, scorer.generate_composite
+    scorer.generate_score, scorer.generate_composite = fake_generate_score, fake_generate_composite
+    try:
+        with Env(DS_API_KEY="sk-test"):
+            res, tag = run.ds_score_fallback("AAA")
+            check("9a relay 失败后 DS 出分成功", bool(res))
+            check("9b 兜底时 cross_model 也切到 DS（否则交叉复核仍打死掉的 relay）",
+                  gs_calls[-1] == (relay.DS_MODEL_TAG, relay.DS_MODEL_TAG), str(gs_calls[-1]))
+            check("9c model_used = ds-direct（落 DB model 列）",
+                  res.get("model_used") == relay.DS_MODEL_TAG, str(res.get("model_used")))
+
+            import run_status
+            sql_sink = FakeConn()
+            orig_ensure = run_status.db.ensure
+            run_status.db.ensure = lambda c: sql_sink
+            try:
+                comp = run_status.score_one(sql_sink, "AAA", {"fresh": "steep"})
+                check("10a 综评跟随同一模型 → 用 ds-direct 而非默认 relay 模型",
+                      gc_calls[-1] == relay.DS_MODEL_TAG, str(gc_calls))
+                check("10b 综评成功（若仍走 relay 这里会抛）", comp["score"] == 7.0)
+                ins = [s for s, p in sql_sink.sql if "INSERT INTO topic_score" in s]
+                check("10c topic_score INSERT 带 model 列", ins and "model" in ins[-1].split("VALUES")[0])
+                params = [p for s, p in sql_sink.sql if "INSERT INTO topic_score" in s][-1]
+                check("10d model 列写入 ds-direct", relay.DS_MODEL_TAG in params, str(params[-2:]))
+            finally:
+                run_status.db.ensure = orig_ensure
+
+        with Env(DS_API_KEY=None):
+            res, tag = run.ds_score_fallback("AAA")
+            check("9d 未武装时评分兜底直接返回 None（不调 DS）", res is None and tag is None)
+    finally:
+        scorer.generate_score, scorer.generate_composite = orig_gs, orig_gc
+
+    print("\n" + "=" * 66)
+    print(f"  通过 {len(PASSED)} / {len(PASSED) + len(FAILED)}")
+    if FAILED:
+        print("  失败：")
+        for f in FAILED:
+            print(f"    - {f}")
+    print("=" * 66)
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

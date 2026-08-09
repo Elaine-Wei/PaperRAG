@@ -1056,7 +1056,9 @@ def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL,
             "novelty_total": novelty_total(norm["novelty_subs"], norm["paper_type"]),
             "domain_relevance": dom_rel, "authority": authority,
             "cross_notes": cross_notes, "path": path,
-            "cross_check": cross_check_on}
+            "cross_check": cross_check_on,
+            # 实际出分的模型（DS 兜底时为 relay.DS_MODEL_TAG）→ 落 daily_score / topic_score 的 model 列
+            "model_used": model}
 
 
 def main():

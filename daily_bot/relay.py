@@ -36,6 +36,24 @@ _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 # "Python-urllib/3.x"（403，且不可重试 → 会把整轮评分全判 FAIL）。任意常规 UA 均可放行。
 _USER_AGENT = "PaperRAG-daily_bot/1.0"
 
+# ---------------------------------------------------------------------------
+# DeepSeek 直连兜底（relay 整体不可用时用）——【逐篇】而非逐调用，见各 runner 的 study/score 循环。
+#   ·DS_API_KEY 未设置 → 兜底关闭，全部行为与从前逐字节一致。
+#   ·DS_MODEL_TAG 是【伪模型名】：调用方把它当 model 传给 relay_chat，即整条调用改走直连 DS。
+#    这样 scorer/deep_study 内部那些 relay.relay_chat(...) 全部自动跟着走 DS，无需逐处改签名；
+#    同时它就是 checkpoint 文件名 / 输出 HTML 名 / DB model 列里的标签（与 relay 代理的
+#    deepseek-v4-pro 明确区分开：那条路仍然经 relay，这条不经）。
+# ---------------------------------------------------------------------------
+DS_MODEL_TAG = "ds-direct"
+DS_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+DS_DEFAULT_MODEL = "deepseek-v4-flash"
+DS_DEFAULT_TIMEOUT = 300      # 实测冷启动可达 165s，远超 relay 的 90s 默认；给足余量
+# DS V4 是推理模型：reasoning_tokens 与正文【共用】max_tokens 预算（实测 max_tokens=16 时
+# 16 个全被 reasoning 吃掉、finish_reason=length）。沿用调用方为 relay 定的小预算会截断正文，
+# 对 judge(220)/composite(500) 这类小额度尤其致命 → 统一放大并设下限。
+DS_TOKEN_HEADROOM = 3
+DS_MIN_MAX_TOKENS = 2048
+
 
 class RelayResponseError(RuntimeError):
     """响应畸形/空（无 choices[0].message.content）——如某模型当前返回坏包。
@@ -71,6 +89,47 @@ def _keys():
 # 兼容旧调用点：仍暴露单 key 配置（内部负载均衡不再走它，但保留以防外部引用）
 def _relay_config():
     return (os.environ.get("RELAY_API_KEY"), _base_url(), _model())
+
+
+def _ds_key():
+    return os.environ.get("DS_API_KEY")
+
+
+def _ds_base_url():
+    return os.environ.get("DS_BASE_URL", DS_DEFAULT_BASE_URL)
+
+
+def _ds_model():
+    return os.environ.get("DS_MODEL", DS_DEFAULT_MODEL)
+
+
+def ds_enabled():
+    """DS 兜底是否已武装（仅看 key 是否存在，不发网络请求；selfcheck 也用它）。"""
+    return bool(_ds_key())
+
+
+def _ds_budget(max_tokens):
+    """把为 relay 定的 max_tokens 放大到 DS 推理模型能用的额度（None=不限，原样透传）。"""
+    if max_tokens is None:
+        return None
+    return max(int(max_tokens) * DS_TOKEN_HEADROOM, DS_MIN_MAX_TOKENS)
+
+
+def relay_chat_ds(system_prompt, user_prompt, temperature=0.3, timeout=DS_DEFAULT_TIMEOUT,
+                  max_tokens=None, model=None):
+    """
+    直连 DeepSeek（不经 relay、不参与多 key 轮换/冷却）。签名与 relay_chat 一致，返回 (content, usage)。
+    DS_API_KEY 未设置 → 抛 RuntimeError，调用方据此认定"兜底不可用"并按原逻辑放弃。
+    HTTP/网络/空响应错误照常抛出（形状与 relay_chat 相同），由调用方处理。
+    """
+    key = _ds_key()
+    if not key:
+        raise RuntimeError("DS_API_KEY 未设置 → DeepSeek 直连兜底未启用")
+    ds_model = model or _ds_model()
+    content, usage = _call(key, _ds_base_url(), ds_model, system_prompt, user_prompt,
+                           temperature, timeout, _ds_budget(max_tokens))
+    _log(f"ds-direct model={ds_model} tokens={(usage or {}).get('total_tokens', '?')}")
+    return content, usage
 
 
 def _is_retryable(exc):
@@ -137,8 +196,14 @@ def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90,
 
     多 key（2/3 把）存在时：主动轮询 + 失败切换 + 120s 冷却（见模块 docstring）。
     单 key 时：仅尝试一次，异常/返回与从前逐字节一致（无切换/冷却/日志）。
+
+    model == DS_MODEL_TAG（"ds-direct"）：整条调用改走直连 DeepSeek，不碰 relay key/轮换/冷却。
     """
     global _next
+    # DS 兜底分派：放在 _keys() 之前——relay key 缺失/失效时兜底仍须可用。
+    if model == DS_MODEL_TAG:
+        return relay_chat_ds(system_prompt, user_prompt, temperature=temperature,
+                             timeout=max(timeout, DS_DEFAULT_TIMEOUT), max_tokens=max_tokens)
     keys = _keys()
     base_url, env_model = _base_url(), _model()
     model = model or env_model

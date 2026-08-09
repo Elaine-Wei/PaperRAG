@@ -693,7 +693,7 @@ def _score_dict(scorer, res):
         "novelty_total": res["novelty_total"], "paper_type": norm["paper_type"],
         "novelty_subitems": {k: {"score": v["score"], "reason": v["reason"]}
                              for k, v in norm["novelty_subs"].items()},
-        "domain": norm["domain"], "model": scorer.MAIN_MODEL,
+        "domain": norm["domain"], "model": res.get("model_used") or scorer.MAIN_MODEL,
         "cross_checked": True, "cross_notes": res["cross_notes"],
         # 两个新维度：领域相关性 + 权威性（authority na → 不写分数，标 na 非 0）
         "domain_relevance_score": (res.get("domain_relevance") or {}).get("score")
@@ -721,8 +721,10 @@ def run_score(conn, limit):
         try:
             res = scorer.generate_score(aid, cross_check_on=True)
         except Exception as e:
-            print(f"[score][WARN] {aid} 打分失败：{e}")
-            continue
+            print(f"[score][WARN] {aid} relay 打分失败：{e}")
+            res, _ds = ds_score_fallback(aid)      # relay 走不通 → DS 直连兜底一次
+            if not res:
+                continue
         conn = db.ensure(conn)  # 打分 LLM 耗时较久，写库前确保连接仍可用
         db.upsert_score(conn, aid, _score_dict(scorer, res))
         db.mark_stage(conn, aid, "score", res["path"])
@@ -789,8 +791,10 @@ def _ensure_score(conn, aid):
     try:
         res = scorer.generate_score(aid, cross_check_on=True)
     except Exception as e:
-        print(f"    [score][WARN] {aid}: {e}")
-        return conn, False
+        print(f"    [score][WARN] {aid} relay: {e}")
+        res, _ds = ds_score_fallback(aid)          # relay 走不通 → DS 直连兜底一次
+        if not res:
+            return conn, False
     conn = db.ensure(conn)  # 打分 LLM 耗时较久，写库前确保连接可用
     db.upsert_score(conn, aid, _score_dict(scorer, res))
     db.mark_stage(conn, aid, "score", res["path"])
@@ -840,7 +844,14 @@ def _ensure_composite(conn, aid):
         "domain_relevance": fv(sc.get("domain_relevance_score")),
         "authority": ("N/A" if sc.get("authority_na") else fv(sc.get("authority_score"))),
     }
-    res = scorer.generate_composite(meta, sub)   # 单次 Claude；失败 → na（不伪造 0）
+    try:
+        res = scorer.generate_composite(meta, sub)   # 单次 Claude；失败 → na（不伪造 0）
+    except Exception as e:
+        import relay
+        if not relay.ds_enabled():
+            raise
+        print(f"    [composite][WARN] {aid} relay 失败（{str(e)[:60]}）→ DS 直连兜底")
+        res = scorer.generate_composite(meta, sub, model=relay.DS_MODEL_TAG)
     conn = db.ensure(conn)
     db.upsert_composite(conn, aid, res["score"], res["reason"] or None)
     print(f"    [composite] {aid} -> {res['score'] if not res['na'] else 'N/A'}"
@@ -882,9 +893,63 @@ def _is_study_complete(conn, aid, min_big=4):
 def _classify_study_error(exc):
     """区分失败类型：relay（限流/超时，退避重试）vs content（内容问题，3 次后放弃该篇）。"""
     s = str(exc).lower()
-    relay_sig = ("503", "429", "502", "504", "timed out", "timeout",
+    # 524 = Cloudflare「源站超时」。此前不在表里 → 被判 content，直接吃掉 3 次放弃额度而不退避；
+    # 2026-08-08 那轮 status 深读 3 篇失败正因如此（"HTTP Error 524: <none>" 不含任何旧关键字）。
+    relay_sig = ("503", "429", "502", "504", "524", "timed out", "timeout",
                  "temporarily", "service unavailable", "bad gateway", "gateway time")
     return "relay" if any(k in s for k in relay_sig) else "content"
+
+
+# --------- DeepSeek 直连兜底（逐篇；relay 这条路走不通了才用）---------
+# 触发点【两个】，缺一不可：
+#   ① content 类失败用尽 max_content_attempts（原方案）；
+#   ② 同一篇 relay 类失败累计 >= DS_AFTER_RELAY_FAILS。②是必需的——524 归为 relay 类之后，
+#     网关超时会一直退避重试到 5h cap 而【永远走不到】①，兜底就对它失效了，而它正是本次要救的场景。
+# 两个触发点都只试 DS 一次：成功→按成功路径收尾（模型标签 ds-direct）；失败→回到原逻辑。
+DS_AFTER_RELAY_FAILS = 2
+
+
+def ds_score_fallback(aid, say=None, **score_kw):
+    """relay 评分已失败 → 直连 DS 重评一次。返回 (res, model_tag)；未启用/失败返回 (None, None)。
+
+    cross_model 也必须是 DS：交叉复核/最终裁定同样是 relay 调用，只换主模型的话仍会撞死掉的 relay。
+    """
+    import scorer
+    import relay
+    _say = say or (lambda m: print(m, flush=True))
+    if not relay.ds_enabled():
+        return None, None
+    try:
+        _say(f"    [score] {aid} → DS 直连兜底（model={relay.DS_MODEL_TAG}）…")
+        res = scorer.generate_score(aid, cross_check_on=True, model=relay.DS_MODEL_TAG,
+                                    cross_model=relay.DS_MODEL_TAG, **score_kw)
+        return res, relay.DS_MODEL_TAG
+    except Exception as e:
+        _say(f"    [score] {aid} DS 兜底也失败（{str(e)[:80]}）")
+        return None, None
+
+
+def ds_study_fallback(aid, logln=None, min_big=4):
+    """直连 DS 重跑一篇深读。成功返回 (path, nbig)；未启用/失败返回 None（绝不抛）。"""
+    import deep_study
+    import relay
+
+    def _say(m):
+        (logln or (lambda x: print(x, flush=True)))(m)
+
+    if not relay.ds_enabled():
+        return None
+    try:
+        _say(f"paper={aid} → DS 直连兜底（model={relay.DS_MODEL_TAG}）…")
+        res = deep_study.generate_study(aid, model=relay.DS_MODEL_TAG)
+        path = res.get("path") if isinstance(res, dict) else None
+        nbig = _count_big_sections(path) if path else 0
+        if path and nbig >= min_big and not _has_begging(path):
+            return path, nbig
+        _say(f"paper={aid} DS 兜底产出不完整（nbig={nbig}<{min_big}）→ 仍按失败处理")
+    except Exception as e:
+        _say(f"paper={aid} DS 兜底也失败（{str(e)[:80]}）")
+    return None
 
 
 def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
@@ -925,6 +990,8 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
 
     pending = list(target_ids)
     content_fails = {a: 0 for a in pending}
+    relay_fails = {a: 0 for a in pending}   # 逐篇 relay 类失败数 → 达阈值触发 DS 兜底
+    ds_tried = set()                        # 每篇最多兜底一次
     completed, gave_up = [], []
     consec_relay = 0
 
@@ -950,6 +1017,24 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
           f"model_rotation={'ON' if rotate_on else 'OFF'} "
           f"models={{" + ', '.join(f'{a}:{m}' for a, m in paper_model.items()) + '}')
 
+    def _try_ds(aid):
+        """relay 这条路对本篇已走不通 → DS 兜底一次。成功则就地收尾并返回 True。"""
+        nonlocal conn
+        if aid in ds_tried:
+            return False
+        ds_tried.add(aid)
+        fb = ds_study_fallback(aid, logln, min_big)
+        if not fb:
+            return False
+        path, nbig = fb
+        conn = db.ensure(conn)
+        db.mark_stage(conn, aid, "deep_study", path)
+        if aid in pending:
+            pending.remove(aid)
+        completed.append(aid)
+        logln(f"paper={aid} model=ds-direct outcome=success-ds nbig={nbig} elapsed={elapsed_m()}m")
+        return True
+
     rnd = 0
     while pending and remaining() > 0:
         rnd += 1
@@ -973,26 +1058,37 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                           f"nbig={nbig} rest=0m elapsed={elapsed_m()}m")
                 else:  # 跑完但不完整（章节太少 或 残留乞讨话术）→ content 失败
                     content_fails[aid] += 1
-                    tag = " -> GIVE-UP(content)" if content_fails[aid] >= max_content_attempts else ""
-                    if content_fails[aid] >= max_content_attempts:
+                    why = "begging" if begging else f"nbig={nbig}<{min_big}"
+                    exhausted = content_fails[aid] >= max_content_attempts
+                    if exhausted and _try_ds(aid):
+                        continue
+                    tag = " -> GIVE-UP(content)" if exhausted else ""
+                    if exhausted:
                         pending.remove(aid)
                         gave_up.append(aid)
-                    why = "begging" if begging else f"nbig={nbig}<{min_big}"
                     logln(f"round={rnd} paper={aid} attempt={content_fails[aid]} "
                           f"outcome=incomplete({why}) nbig={nbig} rest=0m elapsed={elapsed_m()}m{tag}")
             except Exception as e:
                 if _classify_study_error(e) == "relay":
                     consec_relay += 1
+                    relay_fails[aid] = relay_fails.get(aid, 0) + 1
+                    logln(f"round={rnd} paper={aid} attempt={att} outcome=503/timeout "
+                          f"nbig=- elapsed={elapsed_m()}m ({str(e)[:60]})")
+                    # relay 对这一篇连续不通 → 直接换 DS，别把 5h 全耗在退避上
+                    if relay_fails[aid] >= DS_AFTER_RELAY_FAILS and _try_ds(aid):
+                        continue
                     rest = BACKOFF[min(consec_relay - 1, len(BACKOFF) - 1)]
                     rest = min(rest, max(0, remaining()))  # cap-aware
-                    logln(f"round={rnd} paper={aid} attempt={att} outcome=503/timeout "
-                          f"nbig=- rest={int(rest / 60)}m elapsed={elapsed_m()}m ({str(e)[:60]})")
+                    logln(f"round={rnd} paper={aid} rest={int(rest / 60)}m")
                     if rest > 0:
                         time.sleep(rest)  # 歇完换下一篇（round-robin）；本篇留在 pending 下轮再来
                 else:  # content 异常（400 / 坏 PDF 等）
                     content_fails[aid] += 1
-                    tag = " -> GIVE-UP(content)" if content_fails[aid] >= max_content_attempts else ""
-                    if content_fails[aid] >= max_content_attempts:
+                    exhausted = content_fails[aid] >= max_content_attempts
+                    if exhausted and _try_ds(aid):
+                        continue
+                    tag = " -> GIVE-UP(content)" if exhausted else ""
+                    if exhausted:
                         pending.remove(aid)
                         gave_up.append(aid)
                     logln(f"round={rnd} paper={aid} attempt={content_fails[aid]} "

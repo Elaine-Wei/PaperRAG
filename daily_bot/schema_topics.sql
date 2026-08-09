@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS topic_paper (
     importance   NUMERIC(4,1),                 -- sol 便宜「领域重要性」预排(1-10)，用于 shortlist
     importance_reason TEXT,
     shortlist    BOOLEAN DEFAULT FALSE,         -- 是否进入 full-score 短名单（锚点始终 full-score）
+    section      TEXT,                          -- 多分区主题的分区键（如 sttf 的 finance/backbone/survey/crossdomain）；单区主题 NULL
     added_at     TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (topic, arxiv_id)
 );
@@ -36,9 +37,13 @@ CREATE TABLE IF NOT EXISTS topic_score (
     study_path              TEXT,                    -- per-section 深读
     themed_path             TEXT,                    -- theme-block 概览版
     study_complete          BOOLEAN DEFAULT FALSE,
+    model                   TEXT,                    -- 实际出分/深读的模型（DS 直连兜底记 ds-direct）
     scored_at               TIMESTAMP,
     PRIMARY KEY (topic, arxiv_id)
 );
+
+-- 迁移：已存在的 topic_score 补 model 列（与 daily_score.model 对齐；幂等）
+ALTER TABLE topic_score ADD COLUMN IF NOT EXISTS model TEXT;
 
 -- 主题榜单推送去重（与 daily / board 分开）
 CREATE TABLE IF NOT EXISTS topic_push (

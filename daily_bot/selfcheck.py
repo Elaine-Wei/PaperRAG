@@ -49,6 +49,14 @@ def gather():
         ("RelayResponseError" in _src(relay._is_retryable)) and \
         ("RelayResponseError" in _src(relay._call))
 
+    # (a2) DeepSeek 直连兜底（relay 整体不可用时的逐篇 fallback）——只看 env/代码，不发请求
+    r["ds_armed"] = bool(getattr(relay, "ds_enabled", lambda: False)())
+    r["ds_base"] = relay._ds_base_url() if hasattr(relay, "_ds_base_url") else "-"
+    r["ds_model"] = relay._ds_model() if hasattr(relay, "_ds_model") else "-"
+    r["ds_tag"] = getattr(relay, "DS_MODEL_TAG", "-")
+    r["ds_study_hook"] = "ds_study_fallback" in _src(run.run_study_with_backoff)
+    r["ds_score_hook"] = hasattr(run, "ds_score_fallback")
+
     # (b) checkpoint/resume（两条流水线共用 deep_study）
     cp_helpers = all(hasattr(deep_study, h) for h in
                      ("_cp_save", "_cp_load", "_cp_delete", "_fingerprint", "CHECKPOINT_DIR"))
@@ -84,6 +92,13 @@ def report():
           + (f"   (注: {r['keys_err']})" if r.get("keys_err") else ""))
     print(f"  畸形/空响应处理: {_yn(r['malformed_handled'])} "
           "RelayResponseError → 可重试(跨 key 切换)、失败清抛，不再裸 KeyError")
+
+    print("\n[DeepSeek 直连兜底 — relay 整体不可用时的逐篇 fallback]")
+    print(f"  是否已武装     : {_yn(r['ds_armed'])} "
+          + ("DS_API_KEY 已设置" if r["ds_armed"] else "DS_API_KEY 未设置 → 兜底关闭，行为与从前一致"))
+    print(f"  base_url       : {r['ds_base']}")
+    print(f"  model          : {r['ds_model']}   (标签 {r['ds_tag']}：checkpoint/输出名/DB model 列)")
+    print(f"  深读挂载点     : {_yn(r['ds_study_hook'])}   评分挂载点: {_yn(r['ds_score_hook'])}")
 
     def toggle(t):
         return "ON" if t is True else ("OFF" if t is False else f"?{t}")

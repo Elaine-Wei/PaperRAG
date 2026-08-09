@@ -333,7 +333,7 @@ def _get_score(conn, topic, aid):
     return dict(zip(keys, r))
 
 
-def _persist_score(conn, topic, aid, res, composite):
+def _persist_score(conn, topic, aid, res, composite, model=None):
     norm = res["norm"]
     auth = res.get("authority") or {}
     dom = res.get("domain_relevance") or {}
@@ -342,20 +342,21 @@ def _persist_score(conn, topic, aid, res, composite):
             INSERT INTO topic_score
               (topic, arxiv_id, freshness_score, freshness_mode, repro_score, novelty_total,
                paper_type, domain_relevance_score, authority_score, authority_na, authority_venue,
-               composite_score, composite_reason, score_path, scored_at)
-            VALUES (%s,%s,%s,'steep',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+               composite_score, composite_reason, score_path, model, scored_at)
+            VALUES (%s,%s,%s,'steep',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
             ON CONFLICT (topic, arxiv_id) DO UPDATE SET
               freshness_score=EXCLUDED.freshness_score, repro_score=EXCLUDED.repro_score,
               novelty_total=EXCLUDED.novelty_total, paper_type=EXCLUDED.paper_type,
               domain_relevance_score=EXCLUDED.domain_relevance_score,
               authority_score=EXCLUDED.authority_score, authority_na=EXCLUDED.authority_na,
               authority_venue=EXCLUDED.authority_venue, composite_score=EXCLUDED.composite_score,
-              composite_reason=EXCLUDED.composite_reason, score_path=EXCLUDED.score_path, scored_at=NOW()
+              composite_reason=EXCLUDED.composite_reason, score_path=EXCLUDED.score_path,
+              model=EXCLUDED.model, scored_at=NOW()
         """, (topic, aid, res["fresh"]["score"], res["repro_total"], res["novelty_total"],
               norm["paper_type"], dom.get("score"),
               (None if auth.get("na") else auth.get("score")), bool(auth.get("na", True)),
               auth.get("venue"), (None if composite["na"] else composite["score"]),
-              composite["reason"] or None, res["path"]))
+              composite["reason"] or None, res["path"], model))
     conn.commit()
 
 
@@ -411,8 +412,16 @@ def dry_run(topic, window_years, refresh):
 # ---------------------------------------------------------------------------
 def score_one(conn, topic, aid):
     """steep freshness（scorer 默认 45/15）+ 交叉复核 sol → generate_composite → 落 topic_score。"""
-    res = scorer.generate_score(aid, cross_check_on=True, model=SCORE_MAIN,
-                                cross_model=CROSS_MODEL)   # 默认 center=45 scale=15 = steep
+    try:
+        res = scorer.generate_score(aid, cross_check_on=True, model=SCORE_MAIN,
+                                    cross_model=CROSS_MODEL)   # 默认 center=45 scale=15 = steep
+    except Exception as e:
+        # relay 走不通 → DS 直连兜底一次；DS 也不行则抛出，交上游按原逻辑跳过（绝不伪造 0）
+        print(f"  [score] {aid} relay 失败（{str(e)[:60]}）")
+        res, _ds = run.ds_score_fallback(aid)
+        if not res:
+            raise
+    model_used = res.get("model_used") or SCORE_MAIN
     meta = dict(res["meta"])
     meta["area"] = meta.get("area") or "、".join(meta.get("categories") or [])
     norm = res["norm"]
@@ -425,9 +434,10 @@ def score_one(conn, topic, aid):
         "domain_relevance": (res.get("domain_relevance") or {}).get("score"),
         "authority": ("N/A" if auth.get("na") else auth.get("score")),
     }
-    composite = scorer.generate_composite(meta, sub)
+    # 综评必须跟随 score 用同一个模型：否则 DS 兜底时这最后一步仍会打到已经死掉的 relay
+    composite = scorer.generate_composite(meta, sub, model=model_used)
     conn2 = db.ensure(conn)
-    _persist_score(conn2, topic, aid, res, composite)
+    _persist_score(conn2, topic, aid, res, composite, model_used)
     return composite
 
 
@@ -582,6 +592,8 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
     CAP = 5.0 * 3600
     pending = list(targets)
     consec_relay, content_fails = 0, {a: 0 for a in targets}
+    relay_fails = {a: 0 for a in targets}   # 逐篇 relay 类失败数 → 达阈值转 DS
+    ds_tried = set()                        # 每篇最多兜底一次
     completed = []
 
     def logln(msg):
@@ -592,6 +604,44 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
                 f.write(line + "\n")
         except Exception:
             pass
+
+    def _finalize(aid, path, model, nbig, rnd, outcome="success"):
+        """深读产出合格后的收尾：theme 概览 → 评分卡前置 → 落库 → 记完成。relay/DS 两条路共用。"""
+        global conn
+        themed = None
+        try:
+            tr = exp_theme_summary.generate_theme_study(aid, model=model)
+            themed = tr.get("path") if isinstance(tr, dict) else None
+        except Exception as e:
+            logln(f"paper={aid} theme-summary 失败（{str(e)[:50]}），仅用 per-section 深读")
+        sc = _get_score(conn, topic, aid) or {}
+        try:
+            assemble.prepend_score_card_to_study(themed or path, sc.get("score_path"))
+        except Exception as e:
+            logln(f"paper={aid} 评分卡前置失败（{str(e)[:40]}）")
+        conn = db.ensure(conn)
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE topic_score SET study_path=%s, themed_path=%s, model=%s,
+                           study_complete=TRUE WHERE topic=%s AND arxiv_id=%s""",
+                        (path, themed, model, topic, aid))
+        conn.commit()
+        completed.append(aid)
+        if aid in pending:
+            pending.remove(aid)
+        logln(f"round={rnd} paper={aid} model={model} outcome={outcome} nbig={nbig}")
+
+    def _try_ds(aid, rnd):
+        """relay 对本篇已走不通 → DS 直连兜底一次；成功则按成功路径收尾。"""
+        import relay
+        if aid in ds_tried:
+            return False
+        ds_tried.add(aid)
+        fb = run.ds_study_fallback(aid, logln, 4)
+        if not fb:
+            return False
+        path, nbig = fb
+        _finalize(aid, path, relay.DS_MODEL_TAG, nbig, rnd, outcome="success-ds")
+        return True
 
     # 逐-paper 模型：按【原始 targets 下标】定一次，重试各轮沿用同一模型（稳定、逐-paper 而非逐-call）
     rotate_on = STUDY_MODEL_ROTATION if model_rotation is None else model_rotation
@@ -623,44 +673,36 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
                 nbig = run._count_big_sections(path) if path else 0
                 begging = run._has_begging(path) if path else False
                 if nbig >= 4 and not begging:
-                    themed = None
-                    try:
-                        tr = exp_theme_summary.generate_theme_study(aid, model=model)
-                        themed = tr.get("path") if isinstance(tr, dict) else None
-                    except Exception as e:
-                        logln(f"paper={aid} theme-summary 失败（{str(e)[:50]}），仅用 per-section 深读")
-                    sc = _get_score(conn, topic, aid) or {}
-                    try:
-                        assemble.prepend_score_card_to_study(themed or path, sc.get("score_path"))
-                    except Exception as e:
-                        logln(f"paper={aid} 评分卡前置失败（{str(e)[:40]}）")
-                    conn = db.ensure(conn)
-                    with conn.cursor() as cur:
-                        cur.execute("""UPDATE topic_score SET study_path=%s, themed_path=%s,
-                                       study_complete=TRUE WHERE topic=%s AND arxiv_id=%s""",
-                                    (path, themed, topic, aid))
-                    conn.commit()
-                    completed.append(aid)
-                    pending.remove(aid)
+                    _finalize(aid, path, model, nbig, rnd)
                     consec_relay = 0
-                    logln(f"round={rnd} paper={aid} outcome=success nbig={nbig}")
                 else:
                     content_fails[aid] += 1
                     why = "begging" if begging else f"nbig={nbig}<4"
-                    if content_fails[aid] >= 3:
+                    exhausted = content_fails[aid] >= 3
+                    if exhausted and _try_ds(aid, rnd):
+                        continue
+                    if exhausted:
                         pending.remove(aid)
                     logln(f"round={rnd} paper={aid} outcome=incomplete({why}) attempt={content_fails[aid]}")
             except Exception as e:
                 if run._classify_study_error(e) == "relay":
                     consec_relay += 1
+                    relay_fails[aid] = relay_fails.get(aid, 0) + 1
+                    logln(f"round={rnd} paper={aid} outcome=503/timeout ({str(e)[:50]})")
+                    # relay 对这一篇连续不通 → 转 DS，别把 5h 全耗在退避上
+                    if relay_fails[aid] >= run.DS_AFTER_RELAY_FAILS and _try_ds(aid, rnd):
+                        continue
                     rest = min(BACKOFF[min(consec_relay - 1, len(BACKOFF) - 1)] * 60,
                                max(0, CAP - (time.time() - start)))
-                    logln(f"round={rnd} paper={aid} outcome=503/timeout rest={int(rest/60)}m ({str(e)[:50]})")
+                    logln(f"round={rnd} paper={aid} rest={int(rest/60)}m")
                     if rest > 0:
                         time.sleep(rest)
                 else:
                     content_fails[aid] += 1
-                    if content_fails[aid] >= 3:
+                    exhausted = content_fails[aid] >= 3
+                    if exhausted and _try_ds(aid, rnd):
+                        continue
+                    if exhausted:
                         pending.remove(aid)
                     logln(f"round={rnd} paper={aid} outcome=content-error attempt={content_fails[aid]} ({str(e)[:50]})")
 
