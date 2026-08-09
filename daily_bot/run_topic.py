@@ -102,9 +102,10 @@ _JUDGE_SYS = (
     '只输出 JSON：{"is_self_evolving_agent":true或false,"reason":"一句中文理由"}')
 
 
-def judge_topic(meta, model=JUDGE_MODEL):
+def judge_topic(meta, model=None):
     """sol 一次调用做 keep/drop：{is_self_evolving_agent, reason}。503 退避重试。"""
     import relay
+    model = model or JUDGE_MODEL   # 调用时解析：--ds 会改写模块级常量
     user = f"标题：{meta.get('title')}\n摘要：{(meta.get('abstract') or '')[:1400]}"
     for k in range(3):
         try:
@@ -128,9 +129,10 @@ _IMPORTANCE_SYS = (
     '只输出 JSON：{"importance":1到10的整数,"reason":"一句中文"}')
 
 
-def field_importance(meta, model=JUDGE_MODEL):
+def field_importance(meta, model=None):
     """一次 sol 调用给领域重要性打分(1-10)。失败→(None, 理由)。503 退避重试。"""
     import relay
+    model = model or JUDGE_MODEL   # 调用时解析：--ds 会改写模块级常量
     user = f"标题：{meta.get('title')}\n摘要：{(meta.get('abstract') or '')[:1400]}"
     for k in range(3):
         try:
@@ -575,6 +577,7 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
     import exp_theme_summary
     import assemble
     import cos_upload
+    import relay
     global conn
     if override_ids:
         targets = list(override_ids)
@@ -666,13 +669,15 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
         for aid in list(pending):
             if (CAP - (time.time() - start)) <= 0:
                 break
-            model = paper_model.get(aid, STUDY_MODEL)   # 该论文全程单一模型（含 theme-summary）
+            # provider 轮换：哪一家持续挂就用另一家（滚动，见 relay.roll_record）
+            model = relay.roll_model(paper_model.get(aid, STUDY_MODEL))   # 该论文全程单一模型（含 theme-summary）
             try:
                 res = deep_study.generate_study(aid, model=model)
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = run._count_big_sections(path) if path else 0
                 begging = run._has_begging(path) if path else False
                 if nbig >= 4 and not begging:
+                    relay.roll_record(True)
                     _finalize(aid, path, model, nbig, rnd)
                     consec_relay = 0
                 else:
@@ -688,6 +693,7 @@ def study_stage(topic, study_top, top_n, webhook, override_ids=None, model_rotat
                 if run._classify_study_error(e) == "relay":
                     consec_relay += 1
                     relay_fails[aid] = relay_fails.get(aid, 0) + 1
+                    relay.roll_record(False)   # 连续失败够久 → 自动换 provider
                     logln(f"round={rnd} paper={aid} outcome=503/timeout ({str(e)[:50]})")
                     # relay 对这一篇连续不通 → 转 DS，别把 5h 全耗在退避上
                     if relay_fails[aid] >= run.DS_AFTER_RELAY_FAILS and _try_ds(aid, rnd):
@@ -818,9 +824,31 @@ def _build_overview(conn, topic, top_n):
 conn = None
 
 
+
+def force_ds():
+    """--ds：DeepSeek 直连当【主力】，全流程不碰 relay（不等 relay、不退避、不 failover）。
+
+    relay 连续多日 1010/524 时用这个：judge/评分/交叉复核/深读/theme 全部走 ds-direct。
+    逐-paper 轮换自动关闭（只有一个模型可轮）。DS_API_KEY 未设置 → 直接报错，不静默回退。
+    """
+    global STUDY_MODEL, CROSS_MODEL, JUDGE_MODEL, SCORE_MAIN, MODEL_ROTATION, STUDY_MODEL_ROTATION
+    import relay
+    if not relay.ds_enabled():
+        raise SystemExit("[--ds] DS_API_KEY 未设置 → 无法直连 DeepSeek。请先在 daily_bot/.env 配置。")
+    tag = relay.DS_MODEL_TAG
+    STUDY_MODEL = CROSS_MODEL = JUDGE_MODEL = SCORE_MAIN = tag
+    MODEL_ROTATION = [tag]
+    STUDY_MODEL_ROTATION = False
+    relay.roll_init("ds")   # 起点是 DS；若 DS 也连挂 >=2h，会自动滚回 relay 再试
+    print(f"[--ds] DeepSeek 直连主力模式：judge/评分/交叉复核/深读/theme 全部 {tag} "
+          f"（{relay._ds_model()} @ {relay._ds_base_url()}）；不经 relay，无退避等待。")
+
+
 def main():
     global conn
     args = sys.argv[1:]
+    if "--ds" in args:
+        force_ds()
     if "--topic" not in args:
         print("用法: python daily_bot/run_topic.py --topic X [--dry-run|--score|--study] "
               "[--top-n 10] [--study-top 3] [--window-years 2] [--refresh-pool] [--webhook URL]")

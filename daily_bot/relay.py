@@ -115,6 +115,68 @@ def _ds_budget(max_tokens):
     return max(int(max_tokens) * DS_TOKEN_HEADROOM, DS_MIN_MAX_TOKENS)
 
 
+# ---------------------------------------------------------------------------
+# provider 轮换（rolling failover）——哪一家【持续】不行就换另一家，来回滚动，绝不吊死在一家上。
+#   ·任一次成功 → 失败计时清零（抖动不算"持续失败"）。
+#   ·同一家连续失败 >= PROVIDER_ROLL_AFTER_S（默认 2h）→ 切到另一家，并给新的一家重新计时；
+#    新的一家若也连续挂 2h，再切回来。如此往复（rolling），无需人工介入。
+#   ·DS 未武装（无 DS_API_KEY）→ 无处可切，留在 relay。
+#   ·PROVIDER_ROLL_AFTER_S 可用环境变量覆盖（秒）。
+# ---------------------------------------------------------------------------
+def _roll_after_s():
+    try:
+        return float(os.environ.get("PROVIDER_ROLL_AFTER_S", 2 * 3600))
+    except (TypeError, ValueError):
+        return 2 * 3600
+
+
+_roll = {"provider": "relay", "fail_since": None, "switches": 0}
+
+
+def roll_init(provider):
+    """设定起始 provider（"ds" | "relay"）。--ds 启动即 roll_init("ds")。"""
+    _roll["provider"] = provider
+    _roll["fail_since"] = None
+
+
+def roll_current():
+    return _roll["provider"]
+
+
+def roll_status():
+    fs = _roll["fail_since"]
+    return {"provider": _roll["provider"], "switches": _roll["switches"],
+            "failing_for_s": (0 if fs is None else max(0.0, time.time() - fs))}
+
+
+def roll_model(relay_model):
+    """把"这一篇原本要用的 relay 模型"翻译成当前 provider 实际该用的模型名。"""
+    return DS_MODEL_TAG if _roll["provider"] == "ds" else relay_model
+
+
+def roll_record(ok, now=None):
+    """记一次调用结果；连续失败够久就切换 provider。返回是否发生了切换。"""
+    now = time.time() if now is None else now
+    if ok:
+        _roll["fail_since"] = None
+        return False
+    if _roll["fail_since"] is None:
+        _roll["fail_since"] = now          # 开始计时
+        return False
+    if now - _roll["fail_since"] < _roll_after_s():
+        return False
+    other = "relay" if _roll["provider"] == "ds" else "ds"
+    if other == "ds" and not ds_enabled():
+        return False                        # DS 未武装 → 无处可切，继续留在 relay
+    hrs = (now - _roll["fail_since"]) / 3600.0
+    _roll["provider"] = other
+    _roll["fail_since"] = now               # 新 provider 重新计时（它也可能不行）
+    _roll["switches"] += 1
+    _log(f"provider 连续失败 {hrs:.1f}h（>= {_roll_after_s()/3600:.1f}h）→ 轮换到 {other}"
+         f"（第 {_roll['switches']} 次轮换）")
+    return True
+
+
 def relay_chat_ds(system_prompt, user_prompt, temperature=0.3, timeout=DS_DEFAULT_TIMEOUT,
                   max_tokens=None, model=None):
     """

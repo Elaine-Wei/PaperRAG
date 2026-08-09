@@ -111,9 +111,10 @@ def _prefilter(meta):
 # ---------------------------------------------------------------------------
 # sol 判官（逐区 keep/drop；金融区解析 arch）
 # ---------------------------------------------------------------------------
-def judge(meta, judge_sys, model=JUDGE_MODEL):
+def judge(meta, judge_sys, model=None):
     """一次 sol 调用 keep/drop（+金融 arch）。返回 (keep:bool, arch:str, reason:str)。503 退避重试。"""
     import relay
+    model = model or JUDGE_MODEL   # 调用时解析：--ds 会改写模块级常量
     user = f"标题：{meta.get('title')}\n摘要：{(meta.get('abstract') or '')[:1400]}"
     for k in range(3):
         try:
@@ -529,6 +530,7 @@ def study_stage(override_ids=None, model_rotation=None, webhook=""):
     import exp_theme_summary
     import assemble
     import cos_upload
+    import relay
     global conn
     targets = _resolve_targets(conn, override_ids)
     if not targets:
@@ -612,13 +614,15 @@ def study_stage(override_ids=None, model_rotation=None, webhook=""):
         for aid, sec in list(pending):
             if (CAP - (time.time() - start)) <= 0:
                 break
-            model = paper_model.get(aid, STUDY_MODEL)
+            # provider 轮换：哪一家持续挂就用另一家（滚动，见 relay.roll_record）
+            model = relay.roll_model(paper_model.get(aid, STUDY_MODEL))
             try:
                 res = deep_study.generate_study(aid, model=model)
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = run._count_big_sections(path) if path else 0
                 begging = run._has_begging(path) if path else False
                 if nbig >= 4 and not begging:
+                    relay.roll_record(True)
                     _finalize(aid, sec, path, model, nbig, rnd)
                     consec_relay = 0
                 else:
@@ -634,6 +638,7 @@ def study_stage(override_ids=None, model_rotation=None, webhook=""):
                 if run._classify_study_error(e) == "relay":
                     consec_relay += 1
                     relay_fails[aid] = relay_fails.get(aid, 0) + 1
+                    relay.roll_record(False)   # 连续失败够久 → 自动换 provider
                     logln(f"round={rnd} paper={aid} outcome=503/timeout ({str(e)[:50]})")
                     # relay 对这一篇连续不通 → 转 DS，别把 5h 全耗在退避上
                     if relay_fails[aid] >= run.DS_AFTER_RELAY_FAILS and _try_ds(aid, sec, rnd):
@@ -738,9 +743,31 @@ def _build_overview(conn):
 conn = None
 
 
+
+def force_ds():
+    """--ds：DeepSeek 直连当【主力】，全流程不碰 relay（不等 relay、不退避、不 failover）。
+
+    relay 连续多日 1010/524 时用这个：judge/评分/交叉复核/深读/theme 全部走 ds-direct。
+    逐-paper 轮换自动关闭（只有一个模型可轮）。DS_API_KEY 未设置 → 直接报错，不静默回退。
+    """
+    global STUDY_MODEL, CROSS_MODEL, JUDGE_MODEL, SCORE_MAIN, MODEL_ROTATION, STUDY_MODEL_ROTATION
+    import relay
+    if not relay.ds_enabled():
+        raise SystemExit("[--ds] DS_API_KEY 未设置 → 无法直连 DeepSeek。请先在 daily_bot/.env 配置。")
+    tag = relay.DS_MODEL_TAG
+    STUDY_MODEL = CROSS_MODEL = JUDGE_MODEL = SCORE_MAIN = tag
+    MODEL_ROTATION = [tag]
+    STUDY_MODEL_ROTATION = False
+    relay.roll_init("ds")   # 起点是 DS；若 DS 也连挂 >=2h，会自动滚回 relay 再试
+    print(f"[--ds] DeepSeek 直连主力模式：judge/评分/交叉复核/深读/theme 全部 {tag} "
+          f"（{relay._ds_model()} @ {relay._ds_base_url()}）；不经 relay，无退避等待。")
+
+
 def main():
     global conn
     args = sys.argv[1:]
+    if "--ds" in args:
+        force_ds()
     window_years = 2
     refresh = "--refresh-pool" in args
 

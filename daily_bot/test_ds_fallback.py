@@ -274,6 +274,54 @@ def main():
     finally:
         scorer.generate_score, scorer.generate_composite = orig_gs, orig_gc
 
+    # ---------------------------------------------------------------------
+    # 11 provider 轮换（rolling failover）：哪家持续挂就换另一家，来回滚
+    # ---------------------------------------------------------------------
+    print("\n=== 11 provider 轮换（连续失败 >= 2h 换家，滚动） ===")
+
+    with Env(DS_API_KEY="sk-test", PROVIDER_ROLL_AFTER_S="7200"):
+        T = 1_000_000.0
+        H = 3600.0
+
+        relay.roll_init("relay")
+        check("11a 起点 = relay", relay.roll_current() == "relay")
+        check("11b 模型翻译：relay 家 → 保持原模型",
+              relay.roll_model("gpt-5.6-sol") == "gpt-5.6-sol")
+
+        # 失败但没到 2h → 不换
+        relay.roll_record(False, now=T)
+        relay.roll_record(False, now=T + 1 * H)
+        check("11c 连续失败 1h（< 2h）→ 不换家", relay.roll_current() == "relay")
+
+        # 中途成功 → 计时清零，抖动不算"持续失败"
+        relay.roll_record(True, now=T + 1.5 * H)
+        relay.roll_record(False, now=T + 1.6 * H)
+        relay.roll_record(False, now=T + 3.0 * H)   # 距新的 fail_since 仅 1.4h
+        check("11d 中途成功会清零计时（抖动不触发换家）", relay.roll_current() == "relay")
+
+        # 连续失败满 2h → 换到 ds
+        switched = relay.roll_record(False, now=T + 3.7 * H)   # 距 fail_since(1.6h) = 2.1h
+        check("11e 连续失败 >= 2h → 换到 ds", relay.roll_current() == "ds" and switched)
+        check("11f 换家后模型翻译 → ds-direct",
+              relay.roll_model("gpt-5.6-sol") == relay.DS_MODEL_TAG)
+
+        # ds 也连挂 2h → 滚回 relay（这就是"rolling"）
+        relay.roll_record(False, now=T + 4.0 * H)
+        switched = relay.roll_record(False, now=T + 6.2 * H)
+        check("11g ds 也连挂 >= 2h → 滚回 relay（rolling，不吊死在任一家）",
+              relay.roll_current() == "relay" and switched)
+        check("11h 已发生 2 次轮换", relay.roll_status()["switches"] == 2,
+              str(relay.roll_status()))
+
+    # DS 未武装 → 无处可切，永远留在 relay
+    with Env(DS_API_KEY=None, PROVIDER_ROLL_AFTER_S="7200"):
+        relay.roll_init("relay")
+        relay.roll_record(False, now=T)
+        relay.roll_record(False, now=T + 5 * H)
+        check("11i DS 未武装 → 无处可切，留在 relay（不空转）", relay.roll_current() == "relay")
+
+    relay.roll_init("relay")   # 还原，避免影响后续/真实运行
+
     print("\n" + "=" * 66)
     print(f"  通过 {len(PASSED)} / {len(PASSED) + len(FAILED)}")
     if FAILED:

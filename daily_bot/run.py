@@ -967,6 +967,7 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
     只包住深读步骤；打分/综评不受影响。返回 {completed, gave_up, pending, log_path}。
     """
     import deep_study
+    import relay
     log_path = os.path.join(HERE, "top30_study_retry.log")
 
     def logln(msg):
@@ -1043,12 +1044,15 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
             if remaining() <= 0:
                 break
             att = content_fails[aid] + 1
+            # provider 轮换：哪一家持续挂就用另一家（滚动，见 relay.roll_record）
+            _m = relay.roll_model(paper_model.get(aid, deep_study.DEFAULT_MODEL))
             try:
-                res = deep_study.generate_study(aid, model=paper_model.get(aid, deep_study.DEFAULT_MODEL))
+                res = deep_study.generate_study(aid, model=_m)
                 path = res.get("path") if isinstance(res, dict) else None
                 nbig = _count_big_sections(path) if path else 0
                 begging = _has_begging(path) if path else False
                 if nbig >= min_big and not begging:
+                    relay.roll_record(True)
                     conn = db.ensure(conn)  # 循环含长 sleep，写库前重连
                     db.mark_stage(conn, aid, "deep_study", path)
                     pending.remove(aid)
@@ -1072,6 +1076,7 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                 if _classify_study_error(e) == "relay":
                     consec_relay += 1
                     relay_fails[aid] = relay_fails.get(aid, 0) + 1
+                    relay.roll_record(False)   # 连续失败够久 → 自动换 provider
                     logln(f"round={rnd} paper={aid} attempt={att} outcome=503/timeout "
                           f"nbig=- elapsed={elapsed_m()}m ({str(e)[:60]})")
                     # relay 对这一篇连续不通 → 直接换 DS，别把 5h 全耗在退避上
