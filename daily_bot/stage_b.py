@@ -61,7 +61,7 @@ def _user_prompt(batch):
     return "\n".join(parts)
 
 
-def classify(candidates, batch_size=BATCH_SIZE):
+def classify(candidates, batch_size=BATCH_SIZE, model=None):
     """
     对候选池做 stage-B 分类。就地给每篇写入 stage_b_area / stage_b_reason（成功时）。
     返回 {"verdicts": {id:(area,reason)}, "failed": [id...], "usages": [usage...]}。
@@ -74,8 +74,9 @@ def classify(candidates, batch_size=BATCH_SIZE):
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i:i + batch_size]
         try:
+            # model=None → 沿用 relay 默认（与从前一致）；调用方可传 ds-direct 走 DeepSeek 直连
             content, usage = relay.relay_chat(_system_prompt(), _user_prompt(batch),
-                                               temperature=0.0)
+                                               temperature=0.0, model=model)
             if usage:
                 usages.append(usage)
             parsed = relay.extract_json(content)

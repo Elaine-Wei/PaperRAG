@@ -322,6 +322,132 @@ def main():
 
     relay.roll_init("relay")   # 还原，避免影响后续/真实运行
 
+    # ---------------------------------------------------------------------
+    # 12 daily（run.py）的 --ds 主力模式：与三个 topic runner 同形
+    #    重点是【评分路径】：scorer.generate_score / generate_composite 的 model= 默认值是
+    #    def 时绑定到 scorer.MAIN_MODEL 的，改模块常量没用 → 调用方必须显式传（今天满屏 NA 的根因）。
+    # ---------------------------------------------------------------------
+    print("\n=== 12 daily run.py --ds 主力模式 ===")
+
+    saved = (run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL,
+             run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION)
+    tag = relay.DS_MODEL_TAG
+    try:
+        # --- 12a 默认（不带 --ds）：解析到各模块自身默认，行为与从前一致 ---
+        check("12a 默认 STUDY 模型 = deep_study.DEFAULT_MODEL",
+              run._study_model() == deep_study.DEFAULT_MODEL, run._study_model())
+        check("12b 默认 SCORE/CROSS = scorer 自身默认",
+              run._score_model() == scorer.MAIN_MODEL
+              and run._cross_model() == scorer.CROSSCHECK_MODEL,
+              f"{run._score_model()}/{run._cross_model()}")
+        check("12c 默认 JUDGE_MODEL 为 None（relay 默认模型，导读/stage-B 不变）",
+              run.JUDGE_MODEL is None)
+
+        # --- 12d DS_API_KEY 未设置 → 直接退出，不静默回退到已死的 relay ---
+        with Env(DS_API_KEY=None):
+            try:
+                run.force_ds()
+                check("12d DS_API_KEY 未设置时 --ds 立即退出", False, "没抛 SystemExit")
+            except SystemExit:
+                check("12d DS_API_KEY 未设置时 --ds 立即退出（不静默回退）", True)
+            check("12e 退出后未污染模型常量（仍是默认）", run.SCORE_MAIN is None)
+
+        with Env(DS_API_KEY="sk-test"):
+            run.force_ds()
+            check("12f force_ds 把 4 个模型全部翻到 ds-direct",
+                  (run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL)
+                  == (tag, tag, tag, tag),
+                  str((run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL)))
+            check("12g 轮换关闭（只有一个模型可轮）",
+                  run.STUDY_MODEL_ROTATION is False and run.MODEL_ROTATION == [tag],
+                  str(run.MODEL_ROTATION))
+            check("12h roll_init('ds') 已武装（2h 滚动失败切回 relay）",
+                  relay.roll_current() == "ds" and relay.roll_model("gpt-5.6-sol") == tag)
+            check("12i 解析器随之翻到 ds-direct（深读/主评/复核）",
+                  run._study_model() == tag and run._score_model() == tag
+                  and run._cross_model() == tag)
+
+            # --- 12j 评分路径：_ensure_score 必须【显式】把 model + cross_model 传给 scorer ---
+            seen_kw = {}
+
+            def fake_gs(aid, cross_check_on=True, model=None, cross_model=None, **kw):
+                seen_kw.update(model=model, cross_model=cross_model)
+                return {"norm": {"repro_subs": {}, "novelty_subs": {}, "repro_overall": "",
+                                 "novelty_overall": "", "paper_type": "application",
+                                 "domain": "q-fin"},
+                        "fresh": {"score": 3.0, "days": 10, "label": "x"},
+                        "repro_total": 3.0, "novelty_total": 3.0,
+                        "domain_relevance": {"score": 5.0, "reason": "r"},
+                        "authority": {"na": True}, "cross_notes": [], "path": "/tmp/s.html",
+                        "model_used": model}
+
+            orig = (scorer.generate_score, scorer.generate_composite, run.db.ensure,
+                    run.db.get_stage_status, run.db.upsert_score, run.db.mark_stage,
+                    run.db.get_score, run.db.get_papers, run.db.get_daily_row,
+                    run.db.upsert_composite)
+            comp_calls = []
+            comp_na_first = {"n": 0}
+
+            def fake_gc(meta, sub, cross_check_on=False, model=None):
+                comp_calls.append(model)
+                return {"score": 7.0, "reason": "ok", "na": False}
+
+            scorer.generate_score, scorer.generate_composite = fake_gs, fake_gc
+            run.db.ensure = lambda c: c
+            run.db.get_stage_status = lambda c, a: {"scored": False, "studied": False}
+            run.db.upsert_score = lambda c, a, d: None
+            run.db.mark_stage = lambda c, a, s, p: None
+            run.db.get_papers = lambda c, ids: [{"title": "t", "categories": []}]
+            run.db.get_daily_row = lambda c, a: {"area": "quant"}
+            run.db.upsert_composite = lambda c, a, s, r: None
+            run.db.get_score = lambda c, a: {"composite_score": None, "model": tag,
+                                             "freshness_score": 3.0, "repro_score": 3.0,
+                                             "novelty_total": 3.0, "paper_type": "application",
+                                             "domain_relevance_score": 5.0, "authority_na": True,
+                                             "authority_score": None}
+            try:
+                run._ensure_score(FakeConn(), "AAA")
+                check("12j _ensure_score 显式传 model=ds-direct（def 时绑定的默认值救不了）",
+                      seen_kw.get("model") == tag, str(seen_kw))
+                check("12k _ensure_score 同时把 cross_model 切到 DS（否则复核仍打死掉的 relay）",
+                      seen_kw.get("cross_model") == tag, str(seen_kw))
+
+                # --- 12l 综评（finding ②）：--ds 下必须走 DS，而不是 scorer.MAIN_MODEL ---
+                run._ensure_composite(FakeConn(), "AAA")
+                check("12l _ensure_composite 用 ds-direct（今天 NA 综评的根因）",
+                      comp_calls[-1] == tag, str(comp_calls))
+
+                # --- 12m 非 --ds 下 generate_composite 吞异常只返回 na → 必须再走一次 DS ---
+                run.SCORE_MAIN = None          # 模拟未加 --ds 的日常运行
+                comp_calls.clear()
+
+                def fake_gc_na(meta, sub, cross_check_on=False, model=None):
+                    comp_calls.append(model)
+                    comp_na_first["n"] += 1
+                    if model == tag:
+                        return {"score": 7.0, "reason": "ok", "na": False}
+                    return {"score": None, "reason": "", "na": True}   # relay 死 → 被吞成 na
+
+                scorer.generate_composite = fake_gc_na
+                run.db.get_score = lambda c, a: {"composite_score": None, "model": "claude-fable-5",
+                                                 "freshness_score": 3.0, "repro_score": 3.0,
+                                                 "novelty_total": 3.0, "paper_type": "application",
+                                                 "domain_relevance_score": 5.0,
+                                                 "authority_na": True, "authority_score": None}
+                _c, ok = run._ensure_composite(FakeConn(), "AAA")
+                check("12m 综评 na（relay 被吞掉的失败）→ 自动再走一次 DS",
+                      comp_calls == ["claude-fable-5", tag], str(comp_calls))
+                check("12n 兜底后综评成功（不再落 N/A）", ok is True)
+            finally:
+                (scorer.generate_score, scorer.generate_composite, run.db.ensure,
+                 run.db.get_stage_status, run.db.upsert_score, run.db.mark_stage,
+                 run.db.get_score, run.db.get_papers, run.db.get_daily_row,
+                 run.db.upsert_composite) = orig
+    finally:
+        (run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL,
+         run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION) = saved
+        relay.roll_init("relay")
+
     print("\n" + "=" * 66)
     print(f"  通过 {len(PASSED)} / {len(PASSED) + len(FAILED)}")
     if FAILED:

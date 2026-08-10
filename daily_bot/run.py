@@ -81,6 +81,41 @@ RELAY_MODEL = os.environ.get("RELAY_MODEL", relay.DEFAULT_MODEL)
 MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
 STUDY_MODEL_ROTATION = False
 
+# 各阶段模型的【覆盖位】（与 run_status/run_sttf/run_topic 的 STUDY/SCORE/CROSS/JUDGE_MODEL 同位）。
+# None = 不覆盖，沿用各模块自身默认（deep_study.DEFAULT_MODEL / scorer.MAIN_MODEL /
+# scorer.CROSSCHECK_MODEL / RELAY_MODEL）→ 不带 --ds 时行为与从前逐字节一致。
+# 关键：一律通过下面的 _xxx_model() 在【调用时】解析。scorer.generate_score / generate_composite
+# 的 model= 默认值是 def 时绑定的（改 scorer.MAIN_MODEL 也没用），所以必须由调用方显式传。
+STUDY_MODEL = None      # 深读（deep_study.generate_study）
+SCORE_MAIN = None       # 主评分 + 最终裁定 + 综评
+CROSS_MODEL = None      # 交叉复核
+JUDGE_MODEL = None      # 筛选（stage-B）与导读
+
+
+def _study_model():
+    import deep_study
+    return STUDY_MODEL or deep_study.DEFAULT_MODEL
+
+
+def _score_model():
+    import scorer
+    return SCORE_MAIN or scorer.MAIN_MODEL
+
+
+def _cross_model():
+    import scorer
+    return CROSS_MODEL or scorer.CROSSCHECK_MODEL
+
+
+def _composite_model(sc=None):
+    """综评必须跟随【实际出分】的模型：否则 DS 出的分最后一步仍会打到已死的 relay（→ 综评 N/A）。
+    --ds 时恒为 ds-direct；否则该篇若是 DS 兜底出的分就用 DS，其余沿用主评分模型。"""
+    if SCORE_MAIN:
+        return SCORE_MAIN
+    if (sc or {}).get("model") == relay.DS_MODEL_TAG:
+        return relay.DS_MODEL_TAG
+    return _score_model()
+
 # arXiv
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 ARXIV_DELAY = 3.0  # arXiv 要求请求间隔 ≥ 3 秒
@@ -322,7 +357,9 @@ def call_relay(paper):
         f"分类：{', '.join(paper.get('categories') or [])}\n\n"
         f"摘要：\n{paper['abstract']}"
     )
-    return relay.relay_chat(DIGEST_SYSTEM_PROMPT, user_prompt, temperature=0.3)
+    # model=None → 沿用 relay 默认（与从前一致）；--ds 时 JUDGE_MODEL=ds-direct，导读也走直连
+    return relay.relay_chat(DIGEST_SYSTEM_PROMPT, user_prompt, temperature=0.3,
+                            model=JUDGE_MODEL)
 
 
 def generate_digest(paper):
@@ -600,7 +637,7 @@ def run_filter(conn):
     noncandidates = [p for p in backlog if not p["areas"]]
     print(f"[甲] backlog {len(backlog)} 篇 → 候选 {len(candidates)}，甲未命中 {len(noncandidates)}")
 
-    sb = stage_b.classify(candidates) if candidates else {"verdicts": {}}
+    sb = stage_b.classify(candidates, model=JUDGE_MODEL) if candidates else {"verdicts": {}}
     if candidates and not sb.get("verdicts"):
         # 乙 整体失败（如 relay 不可达）：本轮不落库，backlog 保留，下次重试
         print("[乙][WARN] stage-B 整体失败，本轮不落库，backlog 保留待下次重试。")
@@ -717,9 +754,10 @@ def run_score(conn, limit):
         return {"picked": 0, "done": 0}
     done = 0
     for aid in ids:
-        print(f"[score] {aid} …（cross-check ON）")
+        print(f"[score] {aid} …（cross-check ON，model={_score_model()}）")
         try:
-            res = scorer.generate_score(aid, cross_check_on=True)
+            res = scorer.generate_score(aid, cross_check_on=True,
+                                        model=_score_model(), cross_model=_cross_model())
         except Exception as e:
             print(f"[score][WARN] {aid} relay 打分失败：{e}")
             res, _ds = ds_score_fallback(aid)      # relay 走不通 → DS 直连兜底一次
@@ -742,9 +780,10 @@ def run_study(conn, limit):
                                       limit=(limit if limit and limit > 0 else 100000))
     studied = []
     for aid, area in rr:
-        print(f"[study] {aid} [{area}] …（multi-pass / {deep_study.DEFAULT_MODEL}，较慢）")
+        _m = relay.roll_model(_study_model())
+        print(f"[study] {aid} [{area}] …（multi-pass / {_m}，较慢）")
         try:
-            sres = deep_study.generate_study(aid, model=deep_study.DEFAULT_MODEL)
+            sres = deep_study.generate_study(aid, model=_m)
         except Exception as e:
             print(f"[study][WARN] {aid} 失败：{e}")
             continue
@@ -789,7 +828,8 @@ def _ensure_score(conn, aid):
     if db.get_stage_status(conn, aid)["scored"]:
         return conn, True
     try:
-        res = scorer.generate_score(aid, cross_check_on=True)
+        res = scorer.generate_score(aid, cross_check_on=True,
+                                    model=_score_model(), cross_model=_cross_model())
     except Exception as e:
         print(f"    [score][WARN] {aid} relay: {e}")
         res, _ds = ds_score_fallback(aid)          # relay 走不通 → DS 直连兜底一次
@@ -810,7 +850,7 @@ def _ensure_study(conn, aid):
     if db.get_stage_status(conn, aid)["studied"]:
         return conn, True
     try:
-        sres = deep_study.generate_study(aid, model=deep_study.DEFAULT_MODEL)
+        sres = deep_study.generate_study(aid, model=relay.roll_model(_study_model()))
     except Exception as e:
         print(f"    [study][WARN] {aid}: {e}")
         return conn, False
@@ -844,13 +884,18 @@ def _ensure_composite(conn, aid):
         "domain_relevance": fv(sc.get("domain_relevance_score")),
         "authority": ("N/A" if sc.get("authority_na") else fv(sc.get("authority_score"))),
     }
+    cmodel = _composite_model(sc)   # 跟随出分模型；--ds 时 = ds-direct
     try:
-        res = scorer.generate_composite(meta, sub)   # 单次 Claude；失败 → na（不伪造 0）
+        res = scorer.generate_composite(meta, sub, model=cmodel)  # 失败 → na（不伪造 0）
     except Exception as e:
-        import relay
-        if not relay.ds_enabled():
+        if not relay.ds_enabled() or cmodel == relay.DS_MODEL_TAG:
             raise
         print(f"    [composite][WARN] {aid} relay 失败（{str(e)[:60]}）→ DS 直连兜底")
+        res = scorer.generate_composite(meta, sub, model=relay.DS_MODEL_TAG)
+    # generate_composite 把 relay 异常【吞掉】只返回 na=True（见 scorer.py），上面的 except 对
+    # relay 挂掉根本不会触发 —— 今天满屏 N/A 综评就是这么来的。na 也必须走一次 DS 兜底。
+    if res.get("na") and cmodel != relay.DS_MODEL_TAG and relay.ds_enabled():
+        print(f"    [composite][WARN] {aid} 综评 na（relay 无有效输出）→ DS 直连兜底")
         res = scorer.generate_composite(meta, sub, model=relay.DS_MODEL_TAG)
     conn = db.ensure(conn)
     db.upsert_composite(conn, aid, res["score"], res["reason"] or None)
@@ -1000,7 +1045,7 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
     rotate_on = STUDY_MODEL_ROTATION if model_rotation is None else model_rotation
 
     def _paper_model(i):
-        return MODEL_ROTATION[i % len(MODEL_ROTATION)] if rotate_on else deep_study.DEFAULT_MODEL
+        return MODEL_ROTATION[i % len(MODEL_ROTATION)] if rotate_on else _study_model()
     paper_model = {aid: _paper_model(i) for i, aid in enumerate(target_ids)}
 
     # 增量：已完整的直接算完成（断点续跑）
@@ -1045,7 +1090,7 @@ def run_study_with_backoff(conn, target_ids, cap_hours=5.0,
                 break
             att = content_fails[aid] + 1
             # provider 轮换：哪一家持续挂就用另一家（滚动，见 relay.roll_record）
-            _m = relay.roll_model(paper_model.get(aid, deep_study.DEFAULT_MODEL))
+            _m = relay.roll_model(paper_model.get(aid, _study_model()))
             try:
                 res = deep_study.generate_study(aid, model=_m)
                 path = res.get("path") if isinstance(res, dict) else None
@@ -1478,7 +1523,28 @@ def _arg_int(name, default):
     return default
 
 
+def force_ds():
+    """--ds：DeepSeek 直连当【主力】，全流程不碰 relay（不等 relay、不退避、不 failover）。
+
+    relay 连续多日 1010/524 时用这个：筛选(stage-B)/导读/评分/交叉复核/综评/深读 全部走 ds-direct。
+    逐-paper 轮换自动关闭（只有一个模型可轮）。DS_API_KEY 未设置 → 直接报错，不静默回退到已死的 relay。
+    与 run_status/run_sttf/run_topic 的 force_ds() 同形。
+    """
+    global STUDY_MODEL, CROSS_MODEL, JUDGE_MODEL, SCORE_MAIN, MODEL_ROTATION, STUDY_MODEL_ROTATION
+    if not relay.ds_enabled():
+        raise SystemExit("[--ds] DS_API_KEY 未设置 → 无法直连 DeepSeek。请先在 daily_bot/.env 配置。")
+    tag = relay.DS_MODEL_TAG
+    STUDY_MODEL = CROSS_MODEL = JUDGE_MODEL = SCORE_MAIN = tag
+    MODEL_ROTATION = [tag]
+    STUDY_MODEL_ROTATION = False
+    relay.roll_init("ds")   # 起点是 DS；若 DS 也连挂 >=2h，会自动滚回 relay 再试
+    print(f"[--ds] DeepSeek 直连主力模式：筛选/导读/评分/交叉复核/综评/深读 全部 {tag} "
+          f"（{relay._ds_model()} @ {relay._ds_base_url()}）；不经 relay，无退避等待。")
+
+
 def main():
+    if "--ds" in sys.argv:
+        force_ds()
     limit = int(os.environ.get("DAILY_DIGEST_LIMIT", _arg_int("--digest-limit", DIGEST_LIMIT)))
     score_limit = _arg_int("--score-limit", SCORE_LIMIT)
     study_limit = _arg_int("--study-limit", STUDY_LIMIT)
@@ -1504,6 +1570,10 @@ def main():
         print("== Step 1: 抓取 + 入库（ingest）==")
         papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
         print(f"[fetch] 抓取 {len(papers)} 篇（去重后）")
+        # 抓取要跑好几分钟（每 query 间隔 3s + 超时重试），期间无 DB 流量 → Supabase pooler
+        # 会把这条连接关掉，ingest 第一次写就 "server closed the connection unexpectedly"。
+        # 与其它"长操作后再写库"的点一样，写前先 ensure（ping/重连）。
+        conn = db.ensure(conn)
         new = 0
         for p in papers:
             db.upsert_paper(conn, p)                       # 写入共享 papers（冲突忽略）

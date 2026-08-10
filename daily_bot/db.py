@@ -408,7 +408,8 @@ def get_score(conn, arxiv_id):
             "paper_type", "domain",
             "domain_relevance_score", "authority_score", "authority_na",
             "authority_institutions", "authority_venue",
-            "composite_score", "composite_reason"]
+            "composite_score", "composite_reason",
+            "model"]   # 实际出分模型（ds-direct / relay 模型）→ 综评据此跟随同一家，见 run._composite_model
     with conn.cursor() as cur:
         cur.execute(f"SELECT {', '.join(cols)} FROM daily_score WHERE arxiv_id=%s;",
                     (arxiv_id,))
