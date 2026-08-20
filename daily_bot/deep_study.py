@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,10 +70,26 @@ def fetch_metadata(arxiv_id):
     return papers[0] if papers else None
 
 
-def download_pdf(pdf_url):
-    req = urllib.request.Request(pdf_url, headers=UA)
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return r.read()
+def download_pdf(pdf_url, tries=4):
+    """下载 PDF；arXiv 文件服务器偶发中途断流(IncompleteRead)/超时 → 重试。
+    校验 Content-Length（若给出）是否读全，未读全视作失败重试。仍失败则抛出（上游按 content 处理）。"""
+    last = None
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(pdf_url, headers=UA)
+            with urllib.request.urlopen(req, timeout=180) as r:
+                clen = r.headers.get("Content-Length")
+                data = r.read()
+            if clen is not None and data and len(data) < int(clen):
+                raise IOError(f"下载不完整：{len(data)}/{clen} 字节")
+            if not data:
+                raise IOError("下载为空")
+            return data
+        except Exception as e:
+            last = e
+            print(f"    [pdf] 下载失败({type(e).__name__}:{str(e)[:40]})，重试 {k+1}/{tries}", flush=True)
+            time.sleep(3 * (k + 1))
+    raise last
 
 
 def extract_pdf_text(pdf_bytes):
@@ -1149,14 +1166,35 @@ def generate_single_pass(meta, text, pages, css, model):
     }
 
 
-def generate_study(arxiv_id, model=DEFAULT_MODEL, outline_only=False):
-    print(f"[study] 取元数据 {arxiv_id} …（模型：{model}）")
-    meta = fetch_metadata(arxiv_id)
-    if not meta:
-        raise RuntimeError(f"arXiv 查不到 {arxiv_id}")
-    pdf_url = meta.get("pdf_url") or f"https://arxiv.org/pdf/{arxiv_id}"
-    print(f"[study] 下载 PDF {pdf_url} …")
-    pdf_bytes = download_pdf(pdf_url)
+def generate_study(arxiv_id=None, model=DEFAULT_MODEL, outline_only=False,
+                   local_pdf=None, meta=None):
+    """
+    arxiv_id 模式（默认）：从 arXiv 取元数据 + 下载 PDF。
+    local_pdf 模式（期刊 PDF 无 arXiv 时）：读本地 PDF 字节 + 用 meta 覆盖元数据，跳过所有 arXiv 网络调用。
+      meta 至少给 {"title": "...", "arxiv_id": "<短名，如 STHformer>"}；authors/abstract 可选（缺省空）。
+      合成 id 用于 checkpoint/输出命名；下游 analyze_pdf/generate_multipass/断点续跑 完全不变。
+    """
+    if local_pdf:
+        path = os.path.expanduser(local_pdf)
+        meta = dict(meta or {})
+        meta.setdefault("arxiv_id", arxiv_id or os.path.splitext(os.path.basename(path))[0])
+        meta.setdefault("title", meta["arxiv_id"])
+        meta.setdefault("authors", [])
+        meta.setdefault("abstract", "")
+        arxiv_id = meta["arxiv_id"]
+        print(f"[study] 本地 PDF {path} …（id={arxiv_id}，模型：{model}）")
+        with open(path, "rb") as f:
+            pdf_bytes = f.read()
+        pdf_ver = None
+    else:
+        print(f"[study] 取元数据 {arxiv_id} …（模型：{model}）")
+        meta = fetch_metadata(arxiv_id)
+        if not meta:
+            raise RuntimeError(f"arXiv 查不到 {arxiv_id}")
+        pdf_url = meta.get("pdf_url") or f"https://arxiv.org/pdf/{arxiv_id}"
+        print(f"[study] 下载 PDF {pdf_url} …")
+        pdf_bytes = download_pdf(pdf_url)
+        pdf_ver = _pdf_version(pdf_url)
     full_text, pages, chunks, method = analyze_pdf(pdf_bytes)
     full_text = full_text.strip()
     print(f"[study] PDF {pages} 页，全文 {len(full_text)} 字符"
@@ -1170,7 +1208,7 @@ def generate_study(arxiv_id, model=DEFAULT_MODEL, outline_only=False):
     if chunks:
         return generate_multipass(meta, full_text, pages, chunks, css, model,
                                   method, outline_only=outline_only,
-                                  pdf_version=_pdf_version(pdf_url))
+                                  pdf_version=pdf_ver)
     if outline_only:
         print("[study] 结构切分失败，无法只出大纲。")
         return {"arxiv_id": arxiv_id, "title": meta.get("title"), "model": model,
@@ -1182,14 +1220,39 @@ def main():
     args = [a for a in sys.argv[1:]]
     outline_only = "--outline-only" in args
     args = [a for a in args if a != "--outline-only"]
-    if not args:
-        print("用法: python daily_bot/deep_study.py <arxiv_id> [model] [--outline-only]")
+    # 本地 PDF 模式：--local <pdf路径> [--id 短名] [--title "标题"] [model]
+    local_pdf = local_id = local_title = None
+    if "--local" in args:
+        i = args.index("--local")
+        local_pdf = args[i + 1]
+        args = args[:i] + args[i + 2:]
+        for opt in ("--id", "--title"):
+            if opt in args:
+                j = args.index(opt)
+                val = args[j + 1]
+                if opt == "--id":
+                    local_id = val
+                else:
+                    local_title = val
+                args = args[:j] + args[j + 2:]
+    if not args and not local_pdf:
+        print("用法: python daily_bot/deep_study.py <arxiv_id> [model] [--outline-only]\n"
+              "  本地 PDF: python daily_bot/deep_study.py --local <pdf> [--id 短名] [--title \"标题\"] [model]")
         sys.exit(1)
-    arxiv_id = args[0].strip()
-    model = args[1].strip() if len(args) > 1 else \
-        os.environ.get("DEEP_STUDY_MODEL", DEFAULT_MODEL)
+    model = args[0].strip() if (local_pdf and args) else \
+        (args[1].strip() if (not local_pdf and len(args) > 1) else
+         os.environ.get("DEEP_STUDY_MODEL", DEFAULT_MODEL))
 
-    r = generate_study(arxiv_id, model=model, outline_only=outline_only)
+    if local_pdf:
+        meta = {}
+        if local_id:
+            meta["arxiv_id"] = local_id
+        if local_title:
+            meta["title"] = local_title
+        r = generate_study(local_pdf=local_pdf, meta=meta, model=model, outline_only=outline_only)
+    else:
+        arxiv_id = args[0].strip()
+        r = generate_study(arxiv_id, model=model, outline_only=outline_only)
 
     if r.get("mode", "").startswith("outline-only"):
         print("\n== 仅大纲模式完成 ==")
