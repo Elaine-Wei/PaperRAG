@@ -120,7 +120,7 @@ def _ds_budget(max_tokens):
 #   ·任一次成功 → 失败计时清零（抖动不算"持续失败"）。
 #   ·同一家连续失败 >= PROVIDER_ROLL_AFTER_S（默认 2h）→ 切到另一家，并给新的一家重新计时；
 #    新的一家若也连续挂 2h，再切回来。如此往复（rolling），无需人工介入。
-#   ·DS 未武装（无 DS_API_KEY）→ 无处可切，留在 relay。
+#   ·DS 未武装（无 DS_API_KEY），或本次运行未显式 --ds（未 armed）→ 无处可切，留在 relay。
 #   ·PROVIDER_ROLL_AFTER_S 可用环境变量覆盖（秒）。
 # ---------------------------------------------------------------------------
 def _roll_after_s():
@@ -130,13 +130,17 @@ def _roll_after_s():
         return 2 * 3600
 
 
-_roll = {"provider": "relay", "fail_since": None, "switches": 0}
+_roll = {"provider": "relay", "fail_since": None, "switches": 0, "armed": False}
 
 
 def roll_init(provider):
-    """设定起始 provider（"ds" | "relay"）。--ds 启动即 roll_init("ds")。"""
+    """设定起始 provider（"ds" | "relay"）。--ds 启动即 roll_init("ds")——armed 跟随 provider：
+    只有本次运行显式以 "ds" 初始化过，relay→ds 的自动滚动才被允许（--ds 场景下 ds→relay→ds
+    的双向滚动因此完全不受影响）；未调用过（即未 --ds）时 armed 恒 False，relay→ds 的自动
+    滚动被禁止——不再需要用户不知情地被自动切到可靠性同样存疑的 DeepSeek。"""
     _roll["provider"] = provider
     _roll["fail_since"] = None
+    _roll["armed"] = (provider == "ds")
 
 
 def roll_current():
@@ -166,8 +170,8 @@ def roll_record(ok, now=None):
     if now - _roll["fail_since"] < _roll_after_s():
         return False
     other = "relay" if _roll["provider"] == "ds" else "ds"
-    if other == "ds" and not ds_enabled():
-        return False                        # DS 未武装 → 无处可切，继续留在 relay
+    if other == "ds" and not (ds_enabled() and _roll["armed"]):
+        return False                        # DS 未武装，或本次运行未显式 --ds → 不自动滚到 ds
     hrs = (now - _roll["fail_since"]) / 3600.0
     _roll["provider"] = other
     _roll["fail_since"] = now               # 新 provider 重新计时（它也可能不行）

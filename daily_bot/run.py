@@ -81,6 +81,11 @@ RELAY_MODEL = os.environ.get("RELAY_MODEL", relay.DEFAULT_MODEL)
 MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
 STUDY_MODEL_ROTATION = False
 
+# DS 自动兜底总开关（机制 A/B）：relay 调用失败时是否自动改试 DeepSeek 直连一次。
+# 默认【关闭】——2026-09 relay 恢复三键轮换后，DS 稳定性本身存疑（曾 402/429），
+# 不再作为无提示的最后一道防线；显式 --ds（force_ds()）不受此开关影响，始终按用户选择工作。
+AUTO_DS_FALLBACK = False
+
 # 各阶段模型的【覆盖位】（与 run_status/run_sttf/run_topic 的 STUDY/SCORE/CROSS/JUDGE_MODEL 同位）。
 # None = 不覆盖，沿用各模块自身默认（deep_study.DEFAULT_MODEL / scorer.MAIN_MODEL /
 # scorer.CROSSCHECK_MODEL / RELAY_MODEL）→ 不带 --ds 时行为与从前逐字节一致。
@@ -888,13 +893,13 @@ def _ensure_composite(conn, aid):
     try:
         res = scorer.generate_composite(meta, sub, model=cmodel)  # 失败 → na（不伪造 0）
     except Exception as e:
-        if not relay.ds_enabled() or cmodel == relay.DS_MODEL_TAG:
+        if not AUTO_DS_FALLBACK or not relay.ds_enabled() or cmodel == relay.DS_MODEL_TAG:
             raise
         print(f"    [composite][WARN] {aid} relay 失败（{str(e)[:60]}）→ DS 直连兜底")
         res = scorer.generate_composite(meta, sub, model=relay.DS_MODEL_TAG)
     # generate_composite 把 relay 异常【吞掉】只返回 na=True（见 scorer.py），上面的 except 对
-    # relay 挂掉根本不会触发 —— 今天满屏 N/A 综评就是这么来的。na 也必须走一次 DS 兜底。
-    if res.get("na") and cmodel != relay.DS_MODEL_TAG and relay.ds_enabled():
+    # relay 挂掉根本不会触发 —— 这也需要 AUTO_DS_FALLBACK 才走 DS 兜底，否则综评落 N/A（不伪造分）。
+    if AUTO_DS_FALLBACK and res.get("na") and cmodel != relay.DS_MODEL_TAG and relay.ds_enabled():
         print(f"    [composite][WARN] {aid} 综评 na（relay 无有效输出）→ DS 直连兜底")
         res = scorer.generate_composite(meta, sub, model=relay.DS_MODEL_TAG)
     conn = db.ensure(conn)
@@ -962,7 +967,7 @@ def ds_score_fallback(aid, say=None, **score_kw):
     import scorer
     import relay
     _say = say or (lambda m: print(m, flush=True))
-    if not relay.ds_enabled():
+    if not AUTO_DS_FALLBACK or not relay.ds_enabled():
         return None, None
     try:
         _say(f"    [score] {aid} → DS 直连兜底（model={relay.DS_MODEL_TAG}）…")
@@ -982,7 +987,7 @@ def ds_study_fallback(aid, logln=None, min_big=4):
     def _say(m):
         (logln or (lambda x: print(x, flush=True)))(m)
 
-    if not relay.ds_enabled():
+    if not AUTO_DS_FALLBACK or not relay.ds_enabled():
         return None
     try:
         _say(f"paper={aid} → DS 直连兜底（model={relay.DS_MODEL_TAG}）…")

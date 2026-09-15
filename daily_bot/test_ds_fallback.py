@@ -13,6 +13,15 @@ DS 直连兜底 —— 离线测试（不联网、不连库、不碰 .env 真值
   8  relay_chat(model=ds-direct) 走直连、不碰 relay key；DS 预算放大（推理模型吃 max_tokens）
   9  评分兜底：relay 失败 → DS 出分，model_used/DB model 列 = ds-direct
  10  综评跟随同一模型（否则 DS 兜底会被最后一步的 relay 调用打回）
+ 11  provider 滚动轮换：未 --ds（未 armed）时连续失败也不会自动滚到 ds；--ds 场景下
+     ds↔relay↔ds 的双向滚动完全不受影响
+ 12  daily run.py 的 --ds 主力模式（含机制 A/B 默认关闭、显式打开仍可用两种场景）
+
+2026-09：新增 AUTO_DS_FALLBACK 总开关（默认 False）——机制 A（ds_score_fallback /
+ds_study_fallback）与机制 B（_ensure_composite 的 na 重试）默认不再自动调用 DeepSeek；
+机制 C（provider 滚动）新增 armed 位，仅 --ds（roll_init("ds")）才允许 relay→ds 自动滚动。
+以上 3 个机制在【显式打开】/【显式 --ds】时的原有行为保持不变，测试 0/11/12 分别覆盖
+默认关闭与显式打开两侧。
 
 跑法：python daily_bot/test_ds_fallback.py
 """
@@ -144,9 +153,48 @@ def main():
           cp_ds != deep_study._cp_path("2512.04697", "deepseek-v4-pro"))
 
     # ---------------------------------------------------------------------
-    # 2-5 深读循环：mock deep_study.generate_study，按模型决定成功/失败
+    # 0 AUTO_DS_FALLBACK 默认关闭：兜底函数直接返回 None，完全不碰 DS
+    #   （2026-09：relay 三键轮换恢复后，DS 本身可靠性存疑，不再做无提示的最后防线）
     # ---------------------------------------------------------------------
-    print("\n=== 2-5 深读循环：兜底时机 ===")
+    print("\n=== 0 AUTO_DS_FALLBACK 默认关闭：兜底不生效 ===")
+    check("0  AUTO_DS_FALLBACK 默认为 False", run.AUTO_DS_FALLBACK is False)
+
+    with Env(DS_API_KEY="sk-test"):   # key 在，但总开关关 → 仍不该调 DS
+        gate_calls = []
+
+        def fake_gen_study_gated(aid, model=None):
+            gate_calls.append(model)
+            return {"path": "/tmp/x_ds.html"}
+
+        orig_gen, orig_count = deep_study.generate_study, run._count_big_sections
+        deep_study.generate_study, run._count_big_sections = fake_gen_study_gated, lambda p: 9
+        try:
+            res = run.ds_study_fallback("AAA")
+            check("0a 默认关闭时 ds_study_fallback 直接返回 None，不调用 DS",
+                  res is None and gate_calls == [], str(gate_calls))
+        finally:
+            deep_study.generate_study, run._count_big_sections = orig_gen, orig_count
+
+        def fake_gen_score_gated(aid, cross_check_on=True, model=None, cross_model=None, **kw):
+            gate_calls.append(model)
+            return {}
+
+        orig_gs_gate = scorer.generate_score
+        scorer.generate_score = fake_gen_score_gated
+        try:
+            res2, tag2 = run.ds_score_fallback("AAA")
+            check("0b 默认关闭时 ds_score_fallback 直接返回 (None,None)，不调用 DS",
+                  res2 is None and tag2 is None and gate_calls == [], str(gate_calls))
+        finally:
+            scorer.generate_score = orig_gs_gate
+
+    # ---------------------------------------------------------------------
+    # 2-5 深读循环：mock deep_study.generate_study，按模型决定成功/失败
+    #   AUTO_DS_FALLBACK 显式打开——验证机制 A 这条能力本身还在，只是现在要手动选择
+    #   （默认关闭已由上面的 0a/0b 覆盖）。
+    # ---------------------------------------------------------------------
+    print("\n=== 2-5 深读循环：兜底时机（AUTO_DS_FALLBACK 显式打开）===")
+    run.AUTO_DS_FALLBACK = True
 
     def run_loop(relay_mode, ds_ok, ds_key="sk-test", targets=("AAA",)):
         """relay_mode: 'content'(产出不完整) | 'relay-exc'(抛 524)。返回 (结果, 调用轨迹)。"""
@@ -216,10 +264,14 @@ def main():
     check(f"5c 阈值 = DS_AFTER_RELAY_FAILS ({run.DS_AFTER_RELAY_FAILS})",
           len([c for c in calls if c != relay.DS_MODEL_TAG]) == run.DS_AFTER_RELAY_FAILS, str(calls))
 
+    run.AUTO_DS_FALLBACK = False   # 还原默认值，避免污染后续测试
+
     # ---------------------------------------------------------------------
-    # 9-10 评分兜底
+    # 9-10 评分兜底（同样是机制 A/B，AUTO_DS_FALLBACK 显式打开验证能力仍在；
+    #   9d 额外验证 DS_API_KEY 未设置这个独立的门也仍然生效）
     # ---------------------------------------------------------------------
-    print("\n=== 9-10 评分兜底 + 综评模型跟随 ===")
+    print("\n=== 9-10 评分兜底 + 综评模型跟随（AUTO_DS_FALLBACK 显式打开）===")
+    run.AUTO_DS_FALLBACK = True
 
     gs_calls, gc_calls = [], []
 
@@ -273,18 +325,24 @@ def main():
             check("9d 未武装时评分兜底直接返回 None（不调 DS）", res is None and tag is None)
     finally:
         scorer.generate_score, scorer.generate_composite = orig_gs, orig_gc
+        run.AUTO_DS_FALLBACK = False   # 还原默认值，避免污染后续测试
 
     # ---------------------------------------------------------------------
-    # 11 provider 轮换（rolling failover）：哪家持续挂就换另一家，来回滚
+    # 11 provider 轮换（rolling failover）——2026-09 新增 armed 位：
+    #   未 --ds（未调用过 roll_init("ds")）→ armed=False，relay 连续失败再久也不会
+    #   自动滚到 ds（机制 C 默认关闭）；--ds 场景（roll_init("ds") 已调用）→ armed=True，
+    #   ds↔relay↔ds 的双向滚动【完全不受影响】，与此前逐字节一致。
     # ---------------------------------------------------------------------
-    print("\n=== 11 provider 轮换（连续失败 >= 2h 换家，滚动） ===")
+    print("\n=== 11 provider 轮换：armed 位（未 --ds 不自动滚到 ds；--ds 双向滚动不变）===")
 
     with Env(DS_API_KEY="sk-test", PROVIDER_ROLL_AFTER_S="7200"):
         T = 1_000_000.0
         H = 3600.0
 
+        # --- 11a-f：未 --ds（armed=False）—— relay 起点，基本轮换语义不变 ---
         relay.roll_init("relay")
         check("11a 起点 = relay", relay.roll_current() == "relay")
+        check("11a2 未 --ds 时 armed=False", relay._roll["armed"] is False)
         check("11b 模型翻译：relay 家 → 保持原模型",
               relay.roll_model("gpt-5.6-sol") == "gpt-5.6-sol")
 
@@ -299,26 +357,52 @@ def main():
         relay.roll_record(False, now=T + 3.0 * H)   # 距新的 fail_since 仅 1.4h
         check("11d 中途成功会清零计时（抖动不触发换家）", relay.roll_current() == "relay")
 
-        # 连续失败满 2h → 换到 ds
+        # 连续失败满 2h——旧行为会换到 ds；新防护下 armed=False → 不该换
         switched = relay.roll_record(False, now=T + 3.7 * H)   # 距 fail_since(1.6h) = 2.1h
-        check("11e 连续失败 >= 2h → 换到 ds", relay.roll_current() == "ds" and switched)
-        check("11f 换家后模型翻译 → ds-direct",
-              relay.roll_model("gpt-5.6-sol") == relay.DS_MODEL_TAG)
-
-        # ds 也连挂 2h → 滚回 relay（这就是"rolling"）
-        relay.roll_record(False, now=T + 4.0 * H)
-        switched = relay.roll_record(False, now=T + 6.2 * H)
-        check("11g ds 也连挂 >= 2h → 滚回 relay（rolling，不吊死在任一家）",
-              relay.roll_current() == "relay" and switched)
-        check("11h 已发生 2 次轮换", relay.roll_status()["switches"] == 2,
+        check("11e 未 --ds 时，连续失败 >= 2h 也不自动滚到 ds（新防护，机制 C 默认关闭）",
+              relay.roll_current() == "relay" and switched is False)
+        check("11f 未 --ds 时模型翻译保持不变（不泄漏到 ds-direct）",
+              relay.roll_model("gpt-5.6-sol") == "gpt-5.6-sol")
+        check("11f2 未 --ds 时 switches 计数未增加", relay.roll_status()["switches"] == 0,
               str(relay.roll_status()))
 
-    # DS 未武装 → 无处可切，永远留在 relay
+        # --- 11g-k：--ds 场景（roll_init("ds") → armed=True）—— 双向滚动与此前逐字节一致 ---
+        relay.roll_init("ds")
+        check("11g roll_init('ds') 后 armed=True（--ds 显式选择过 DS 主力）",
+              relay._roll["armed"] is True)
+        check("11g2 起点 = ds", relay.roll_current() == "ds")
+
+        relay.roll_record(False, now=T)
+        relay.roll_record(False, now=T + 1 * H)
+        check("11h armed 场景下同样：连续失败 1h（< 2h）→ 不换家", relay.roll_current() == "ds")
+
+        switched = relay.roll_record(False, now=T + 2.1 * H)   # 距 fail_since 2.1h ≥ 2h
+        check("11i armed 场景：ds 连续失败 >= 2h → 滚到 relay（与旧行为逐字节一致）",
+              relay.roll_current() == "relay" and switched)
+        check("11j 滚到 relay 后模型翻译恢复为真实 relay 模型",
+              relay.roll_model("gpt-5.6-sol") == "gpt-5.6-sol")
+
+        # relay 也连挂 2h → 滚回 ds（这就是"rolling"，armed 一旦为 True 全程保持）
+        switched = relay.roll_record(False, now=T + 2.1 * H + 2.2 * H)
+        check("11k relay 也连挂 >= 2h → 滚回 ds（armed 场景下 rolling 双向均正常）",
+              relay.roll_current() == "ds" and switched)
+        check("11l armed 场景下已发生 2 次轮换", relay.roll_status()["switches"] == 2,
+              str(relay.roll_status()))
+
+    # DS 未武装（无 key）→ 无处可切，永远留在 relay（即使 armed=True 也一样）
     with Env(DS_API_KEY=None, PROVIDER_ROLL_AFTER_S="7200"):
+        relay.roll_init("ds")   # 即便"armed"，没有 key 也切不过去
+        relay.roll_record(False, now=T)
+        relay.roll_record(False, now=T + 5 * H)
+        check("11m DS 未武装（无 key）→ 无处可切，留在原地（不空转）",
+              relay.roll_current() in ("relay", "ds"))
+        # roll_init("ds") 本身把 provider 设为 "ds"；真正要验证的是"没有可切换的另一家"，
+        # 即从 relay 起点、无 key 时也切不到 ds（对应旧测试 11i 的场景）：
         relay.roll_init("relay")
         relay.roll_record(False, now=T)
         relay.roll_record(False, now=T + 5 * H)
-        check("11i DS 未武装 → 无处可切，留在 relay（不空转）", relay.roll_current() == "relay")
+        check("11n DS 未武装（无 key）+ 未 --ds → 双重原因都留在 relay",
+              relay.roll_current() == "relay")
 
     relay.roll_init("relay")   # 还原，避免影响后续/真实运行
 
@@ -330,7 +414,7 @@ def main():
     print("\n=== 12 daily run.py --ds 主力模式 ===")
 
     saved = (run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL,
-             run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION)
+             run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION, run.AUTO_DS_FALLBACK)
     tag = relay.DS_MODEL_TAG
     try:
         # --- 12a 默认（不带 --ds）：解析到各模块自身默认，行为与从前一致 ---
@@ -417,7 +501,9 @@ def main():
                 check("12l _ensure_composite 用 ds-direct（今天 NA 综评的根因）",
                       comp_calls[-1] == tag, str(comp_calls))
 
-                # --- 12m 非 --ds 下 generate_composite 吞异常只返回 na → 必须再走一次 DS ---
+                # --- 12m-o 非 --ds 下 generate_composite 吞异常只返回 na——2026-09 起
+                #     AUTO_DS_FALLBACK 默认关闭，不再自动重试 DS：综评停在 N/A，不静默调用
+                #     DeepSeek（这正是本轮要达成的目标：没有 --ds 就没有任何 DS 调用）---
                 run.SCORE_MAIN = None          # 模拟未加 --ds 的日常运行
                 comp_calls.clear()
 
@@ -434,10 +520,24 @@ def main():
                                                  "novelty_total": 3.0, "paper_type": "application",
                                                  "domain_relevance_score": 5.0,
                                                  "authority_na": True, "authority_score": None}
+                check("12m AUTO_DS_FALLBACK 默认关闭（本链路也是 False）",
+                      run.AUTO_DS_FALLBACK is False)
                 _c, ok = run._ensure_composite(FakeConn(), "AAA")
-                check("12m 综评 na（relay 被吞掉的失败）→ 自动再走一次 DS",
-                      comp_calls == ["claude-fable-5", tag], str(comp_calls))
-                check("12n 兜底后综评成功（不再落 N/A）", ok is True)
+                check("12n 默认关闭：综评 na 不再自动重试 DS，只调了一次 relay 模型",
+                      comp_calls == ["claude-fable-5"], str(comp_calls))
+                check("12o 默认关闭：综评停在 N/A（没有静默调用 DeepSeek）", ok is False)
+
+                # --- 12p-q 显式打开 AUTO_DS_FALLBACK：旧的"综评 na → 自动重试 DS"能力
+                #     仍然存在，只是现在需要手动选择，而不是无提示的默认行为 ---
+                comp_calls.clear()
+                run.AUTO_DS_FALLBACK = True
+                try:
+                    _c, ok2 = run._ensure_composite(FakeConn(), "AAA")
+                    check("12p 显式打开后：综评 na → 仍会自动重试一次 DS（能力保留，只是默认关闭）",
+                          comp_calls == ["claude-fable-5", tag], str(comp_calls))
+                    check("12q 重试后综评成功", ok2 is True)
+                finally:
+                    run.AUTO_DS_FALLBACK = False
             finally:
                 (scorer.generate_score, scorer.generate_composite, run.db.ensure,
                  run.db.get_stage_status, run.db.upsert_score, run.db.mark_stage,
@@ -445,7 +545,7 @@ def main():
                  run.db.upsert_composite) = orig
     finally:
         (run.STUDY_MODEL, run.SCORE_MAIN, run.CROSS_MODEL, run.JUDGE_MODEL,
-         run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION) = saved
+         run.MODEL_ROTATION, run.STUDY_MODEL_ROTATION, run.AUTO_DS_FALLBACK) = saved
         relay.roll_init("relay")
 
     print("\n" + "=" * 66)
