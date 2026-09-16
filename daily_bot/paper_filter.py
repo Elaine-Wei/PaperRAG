@@ -31,6 +31,24 @@ BROAD_CATEGORIES = {"cs.LG", "cs.AI", "cs.CL"}
 #   - 广义分类（cs.LG/cs.AI/cs.CL）单独不算；但关键词命中与分类无关。
 # 关键词现在故意放宽（偏召回）：宁可多进噪声，也别漏。误报由 stage-B（LLM 读摘要）剔除。
 FOCUS_AREAS = {
+    "options": {
+        "categories": ["q-fin.CP", "q-fin.PR", "q-fin.TR"],
+        "keywords": ["option", "options", "option pricing", "implied volatility",
+                     "volatility surface", "volatility smile", "option hedging",
+                     "option portfolio", "option strategy"],
+    },
+    "cta": {
+        "categories": ["q-fin.PM", "q-fin.ST", "q-fin.TR"],
+        "keywords": ["CTA", "trend following", "trend-following", "time-series momentum",
+                     "managed futures", "commodity trading advisor", "commodity trading",
+                     "cross-asset trend", "time series momentum"],
+    },
+    "hft": {
+        "categories": ["q-fin.TR", "cs.PF", "cs.DC"],
+        "keywords": ["high-frequency trading", "high frequency trading", "high-frequency",
+                     "tick-level", "tick data", "low-latency", "low latency",
+                     "high-frequency execution", "latency-sensitive"],
+    },
     "quant": {
         "categories": ["q-fin.TR", "q-fin.PM", "q-fin.CP", "q-fin.ST"],
         "keywords": ["quantitative", "trading", "factor", "alpha", "portfolio",
@@ -66,7 +84,7 @@ FOCUS_AREAS = {
 }
 
 # A 类方向的处理/汇报顺序（越靠前优先级越高，用于占用全局上限时的先后）
-A_CLASS_ORDER = ["quant", "ai4math", "lob", "hpc", "agent"]
+A_CLASS_ORDER = ["options", "cta", "hft", "quant", "ai4math", "lob", "hpc", "agent"]
 
 # 选取上限
 MAX_PER_AREA = 2      # 每个方向最多留几篇
@@ -97,6 +115,10 @@ _EXTRA_QUERIES = [
     "cat:q-fin.TR OR cat:q-fin.PM OR cat:q-fin.CP OR cat:q-fin.ST",  # quant / lob
     "cat:cs.DC OR cat:cs.PF",                                        # hpc
     "cat:math.OC",                                                   # ai4math
+    '(ti:"option pricing" OR ti:options OR abs:"implied volatility" OR abs:"volatility surface")',
+    '(ti:CTA OR ti:"trend following" OR abs:"time-series momentum" OR abs:"managed futures")',
+    '(ti:"high-frequency trading" OR ti:"high frequency trading" OR ti:"tick-level" '
+    'OR abs:"low-latency" OR abs:"high-frequency trading")',
 ]
 
 FETCH_QUERIES = list(_BASE_QUERIES) + _EXTRA_QUERIES

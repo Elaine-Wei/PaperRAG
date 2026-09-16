@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS daily_paper (
     arxiv_id        TEXT PRIMARY KEY REFERENCES papers(arxiv_id) ON DELETE CASCADE,
     -- 甲/乙 筛选结果
-    area            TEXT,        -- stage-B 判定：quant/ai4math/lob/hpc/agent | not_relevant | NULL(未筛)
+    area            TEXT,        -- stage-B 判定：options/cta/hft/quant/ai4math/lob/hpc/agent | not_relevant | NULL(未筛)
     filter_reason   TEXT,        -- 一句话理由
     is_relevant     BOOLEAN,     -- 便捷标志（area 属于关注方向）；未筛时为 NULL
     -- 流水线阶段：时间戳非空即代表该阶段已完成（同时记录发生时间）

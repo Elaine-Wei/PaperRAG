@@ -328,6 +328,9 @@ def finalize(meta, scores_for_llm, critique, model=MAIN_MODEL):
 FOCUS_AREAS_DESC = {
     "agent": "LLM/AI agents、multi-agent、agentic workflow、tool use、autonomous planning",
     "quant": "量化金融、交易策略、组合/资产管理、市场预测、q-fin",
+    "options": "期权定价与对冲、隐含波动率、波动率曲面、期权组合与策略",
+    "cta": "CTA、趋势跟踪、时间序列动量、managed futures、商品及跨资产策略",
+    "hft": "高频交易、tick-level 数据、低延迟行情/交易系统与高频市场行为",
     "hpc": "高性能/分布式/并行计算、GPU、系统与基础设施、训练/推理效率",
     "lob": "限价订单簿、市场微观结构、流动性、做市、order flow",
     "ai4math": "AI for math、定理证明、形式化(Lean/Coq)、数学推理",
@@ -338,12 +341,12 @@ DOMAIN_REL_SYS = (
     "我们的核心方向（core）：\n"
     + "".join(f"  - {k}：{v}\n" for k, v in FOCUS_AREAS_DESC.items())
     + "评分阶梯（判断这篇有多紧扣我们的具体方向）：\n"
-    "  5   = 正中某个 core 方向（agent/quant/hpc/lob/ai4math 之一）；\n"
+    "  5   = 正中某个 core 方向（agent/quant/options/cta/hft/hpc/lob/ai4math 之一）；\n"
     "  ~4  = 泛化 AI（相关但不聚焦，如通用 LLM/CV/NLP，未直接命中 core）；\n"
     "  ~3  = 泛化 CS（外围，如一般软件工程/系统/理论）；\n"
     "  1-2 = 更远/边缘（与我们方向基本无关）。\n"
     "给 score 与一句 reason（点明命中/接近哪个方向，或为何偏远）。\n"
-    '只输出 JSON：{"score":0,"area_hit":"agent|quant|hpc|lob|ai4math|general-ai|general-cs|other","reason":""}')
+    '只输出 JSON：{"score":0,"area_hit":"agent|quant|options|cta|hft|hpc|lob|ai4math|general-ai|general-cs|other","reason":""}')
 
 
 def score_domain_relevance(meta, model=MAIN_MODEL):
@@ -531,7 +534,7 @@ COMPOSITE_SYS = (
     "输入是这篇论文的 5 个【已定】子维度分（请勿改动、勿质疑它们，只做综合权衡）：\n"
     "  新鲜度(0-5)、可复现性(0-5)、方法新颖度(0-5)、领域相关性(0-5，对我们关注方向的贴合度)、"
     "权威性(0-5，机构/作者/发表；可能为 N/A)。\n"
-    "综合判断这篇对【我们（agent/quant/hpc/lob/ai4math 方向的量化研究者）】当天的阅读价值："
+    "综合判断这篇对【我们（agent/quant/options/cta/hft/hpc/lob/ai4math 方向的量化研究者）】当天的阅读价值："
     "领域相关性与新颖度通常更重要，可复现性/权威性为加分，新鲜度为次要；权威性 N/A 不扣分。\n"
     "给一个 0-10 的 composite 分（可含一位小数）和一句【中文】综评理由（≤40字，兼作『入选理由』）。\n"
     '只输出 JSON：{"composite":0,"reason":""}')
@@ -794,6 +797,8 @@ font-weight:700;border-radius:14px;padding:3px 12px;font-size:0.92rem;margin:2px
 
 AREA_HIT_ZH = {
     "agent": "正中 agent 核心方向", "quant": "正中 quant 核心方向",
+    "options": "正中 options 核心方向", "cta": "正中 cta 核心方向",
+    "hft": "正中 hft 核心方向",
     "hpc": "正中 hpc 核心方向", "lob": "正中 lob 核心方向",
     "ai4math": "正中 ai4math 核心方向", "general-ai": "泛化 AI（非核心聚焦）",
     "general-cs": "泛化 CS（外围）", "other": "与我们方向较远",
@@ -914,7 +919,7 @@ def render_html(meta, fresh, norm, cross_notes, dom_rel=None, authority=None):
   <div class="dim">领域相关性 Domain relevance · <span class="score">{(f"{dr_score:.1f}" if dr_score is not None else "N/A")}</span> / 5</div>
   <p class="reason">{esc(AREA_HIT_ZH.get((dom_rel or {}).get("area_hit"), "") ) if dom_rel else ""}
    {("— " + esc(dom_rel["reason"])) if (dom_rel and dom_rel.get("reason")) else "（本维度未能评分，N/A）"}</p>
-  <p class="reason" style="color:#777">衡量与我们关注方向（agent/quant/hpc/lob/ai4math）的贴合度：正中核心=5、泛化 AI≈4、泛化 CS≈3、更远 1-2。</p>
+  <p class="reason" style="color:#777">衡量与我们关注方向（agent/quant/options/cta/hft/hpc/lob/ai4math）的贴合度：正中核心=5、泛化 AI≈4、泛化 CS≈3、更远 1-2。</p>
 </div>
 
 <div class="card">
@@ -944,7 +949,7 @@ def render_html(meta, fresh, norm, cross_notes, dom_rel=None, authority=None):
  <strong>基准/数据集</strong>：= 基准/数据集的价值与填补的空白；
  <strong>理论</strong>：理论贡献权重升高；
  <strong>应用/实证</strong>：= 应用/迁移的新颖性。「相对已有工作的增量」理由须点名所建立的先前工作。<br>
-• <strong>领域相关性</strong>：LLM 按我们跟踪的具体方向打分——正中 agent/quant/hpc/lob/ai4math 之一=5、泛化 AI≈4、泛化 CS≈3、更远 1-2。<br>
+• <strong>领域相关性</strong>：LLM 按我们跟踪的具体方向打分——正中 agent/quant/options/cta/hft/hpc/lob/ai4math 之一=5、泛化 AI≈4、泛化 CS≈3、更远 1-2。<br>
 • <strong>权威性</strong>：LLM 依据【全部作者+全部机构+发表信息】判断团队在本文方向上的分量（取最强信号、不看作者排位；不熟悉机构查 OpenAlex 兜底）。得体披露而非贬低：正当机构给公允中档分，信息不足记 <strong>N/A</strong> 而非 0。<br>
 • <strong>领域占比</strong>：非分数，LLM 估计的领域构成百分比（独立于领域相关性，不进雷达）。
 </div>

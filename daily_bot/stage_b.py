@@ -16,14 +16,25 @@ import relay
 # stage-B 使用的方向定义（与 paper_filter.FOCUS_AREAS 的键一致）
 AREA_DEFS = {
     "quant": "量化交易/金融：因子(factor)/alpha、组合优化、做市、回测、统计套利、资产定价、"
-             "执行、波动率、衍生品定价等，或用 AI/ML 做上述金融任务。",
+             "执行、波动率、衍生品定价等，或用 AI/ML 做上述金融任务。注意：若论文核心是期权/"
+             "隐含波动率、CTA/趋势跟踪或高频交易，应归入对应的专门方向。",
+    "options": "期权/波动率/衍生品交易：期权定价与对冲、隐含波动率/波动率曲面、期权组合与策略、"
+                "期权市场微观结构。注意：泛化资产定价、非期权衍生品，或仅把期权作为应用场景不算。",
+    "cta": "CTA/趋势跟踪/管理期货：商品及跨资产的趋势跟踪、时间序列动量、managed futures、CTA "
+           "策略与组合、信号生成、仓位管理、风险配置及回测。注意：泛化量化交易、单纯资产配置"
+           "或非趋势型套利不算。",
+    "hft": "高频交易/低延迟交易：高频交易策略、tick-level 数据、低延迟行情与交易系统、高频执行、"
+           "交易撮合、订单流或做市中的高频行为。注意：普通量化交易、普通订单簿/做市研究、仅使用"
+           "high-frequency 时间序列，或仅用 GPU/分布式训练不算。",
     "ai4math": "AI for math：定理证明、形式化数学(Lean/Coq)、自动形式化、数学推理、"
                "符号推理、竞赛/奥数题求解。注意：普通 ML 优化算法不算。",
     "lob": "限价订单簿 / 市场微观结构：limit order book、order book、撮合引擎、订单流、"
-           "bid-ask、做市微观结构。",
+           "bid-ask、做市微观结构。注意：若核心是高频交易策略、tick-level 行为或低延迟交易系统，"
+           "应归入 hft。",
     "hpc": "高性能/低延迟/分布式系统（面向计算或交易的系统性能）：low-latency、high-frequency "
            "交易系统、distributed/parallel 计算、GPU kernel、调度、推理服务性能。"
-           "注意：仅仅用到 GPU 训练模型不算，重点是系统/性能本身。",
+           "注意：仅仅用到 GPU 训练模型不算，重点是系统/性能本身；金融论文若核心是高频交易策略"
+           "或市场行为，应归入 hft。",
     "agent": "LLM agent / 多智能体 / 工具使用 / RAG / 规划：以 LLM 智能体、multi-agent、"
              "tool use、function calling、agentic workflow、检索增强为核心的论文。",
 }
@@ -42,7 +53,7 @@ def _system_prompt():
         "1. 只依据摘要判断，不要臆测摘要之外的内容。\n"
         "2. 每篇给出一句话理由(reason)，必须落在摘要能支持的事实上，不要编造结果或数字。\n"
         "3. 一篇最多归一个最主要的方向；确实都不沾边就 not_relevant。\n"
-        '4. area 只能取：quant / ai4math / lob / hpc / agent / not_relevant。\n'
+        '4. area 只能取：options / cta / hft / quant / ai4math / lob / hpc / agent / not_relevant。\n'
         '只输出 JSON，形如：'
         '{"verdicts":[{"id":"<arxiv_id>","area":"quant","reason":"..."}]}，不要额外文字。'
     )
