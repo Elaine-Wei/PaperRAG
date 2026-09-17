@@ -20,7 +20,7 @@ LLM 通过 OpenAI 兼容 relay 访问。运行前需要提供 `RELAY_API_KEY`，
 2. **Shell 环境变量**：`export RELAY_API_KEY=...`。shell 中已导出的值优先于 `.env`。
 
 可选变量（均有默认值）：`RELAY_BASE_URL`（默认 `https://a6.a6api.com/v1`）、
-`RELAY_MODEL`（默认 `claude-fable-5`）。
+`RELAY_MODEL`（默认 `gpt-5.6-sol`）。
 
 若未提供 key，导读步骤会失败并以 arXiv 原始摘要兜底（HTML 顶部会显示提示条），
 不影响整体流程跑通。

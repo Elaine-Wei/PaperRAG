@@ -4,7 +4,7 @@ scorer —— 单篇论文打分模块（独立于 deep_study / simple / 每日 
 
 四个维度：
   新鲜度 freshness   —— 代码按发表日期算（非 LLM）：score = 5*(1 - t/7)，t>7 归 0。
-  可复现性 repro     —— Claude(claude-fable-5) 给 4 个子项各打 0/0.5/1，代码算加权总分。
+  可复现性 repro     —— 主评分模型给 4 个子项各打 0/0.5/1，代码算加权总分。
   方法新颖度 novelty —— 先由 Claude 判定论文类型(paper_type)，再按该类型口径给 4 个子项
                        各打 0/0.5/1，代码按类型权重算加权总分（综述等不会因"无新算法"被低估）。
   领域占比 domain    —— LLM 估计各领域大致百分比（不是分数）。
@@ -38,7 +38,7 @@ OUTPUT_DIR = os.path.join(HERE, "output")
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 UA = {"User-Agent": "PaperRAG-scorer/0 (mailto:elaine.wei@xpef.org)"}
 
-MAIN_MODEL = "claude-fable-5"       # 主评分
+MAIN_MODEL = "gpt-5.6-sol"         # 主评分
 CROSSCHECK_MODEL = "gpt-5.6-luna"   # 交叉复核（用不同家族的模型做异构复核）
 MAX_TEXT_CHARS = 50_000
 FRESHNESS_WINDOW_DAYS = 7

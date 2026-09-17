@@ -32,7 +32,7 @@ import deep_study   # noqa: E402
 ARXIV_API = "http://export.arxiv.org/api/query"
 STUDY_MODEL = "gpt-5.6-sol"      # deep-study + theme-summary（luna 宕机）
 CROSS_MODEL = "gpt-5.6-sol"      # 交叉复核走 sol（luna 宕机；daily 默认不变）
-CLF_MODEL = "claude-fable-5"     # LLM-or-not 分类（fable-5 在线）
+CLF_MODEL = "gpt-5.6-sol"       # LLM-or-not 分类
 # 经典区 relaxed freshness（center=365, scale=600）——老经典不被压到 1（AlphaGen 1125d≈2.3）；待学长最终确认
 RELAXED = {"fresh_center": 365, "fresh_scale": 600}
 

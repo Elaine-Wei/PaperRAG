@@ -515,7 +515,7 @@ def main():
                     return {"score": None, "reason": "", "na": True}   # relay 死 → 被吞成 na
 
                 scorer.generate_composite = fake_gc_na
-                run.db.get_score = lambda c, a: {"composite_score": None, "model": "claude-fable-5",
+                run.db.get_score = lambda c, a: {"composite_score": None, "model": "gpt-5.6-sol",
                                                  "freshness_score": 3.0, "repro_score": 3.0,
                                                  "novelty_total": 3.0, "paper_type": "application",
                                                  "domain_relevance_score": 5.0,
@@ -524,7 +524,7 @@ def main():
                       run.AUTO_DS_FALLBACK is False)
                 _c, ok = run._ensure_composite(FakeConn(), "AAA")
                 check("12n 默认关闭：综评 na 不再自动重试 DS，只调了一次 relay 模型",
-                      comp_calls == ["claude-fable-5"], str(comp_calls))
+                      comp_calls == ["gpt-5.6-sol"], str(comp_calls))
                 check("12o 默认关闭：综评停在 N/A（没有静默调用 DeepSeek）", ok is False)
 
                 # --- 12p-q 显式打开 AUTO_DS_FALLBACK：旧的"综评 na → 自动重试 DS"能力
@@ -534,7 +534,7 @@ def main():
                 try:
                     _c, ok2 = run._ensure_composite(FakeConn(), "AAA")
                     check("12p 显式打开后：综评 na → 仍会自动重试一次 DS（能力保留，只是默认关闭）",
-                          comp_calls == ["claude-fable-5", tag], str(comp_calls))
+                          comp_calls == ["gpt-5.6-sol", tag], str(comp_calls))
                     check("12q 重试后综评成功", ok2 is True)
                 finally:
                     run.AUTO_DS_FALLBACK = False

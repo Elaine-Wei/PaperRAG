@@ -3,7 +3,7 @@ stage_b（乙）—— 用 LLM 读摘要做真正的相关性判断 + 方向分�
 
 甲（paper_filter）是宽松的关键词粗召回网，会带进噪声（例如仅因出现 "factor" 就把
 一篇 LLM 论文标成 quant）。stage-B 把每篇的 title+abstract 交给 relay LLM
-（claude-fable-5，复用 relay.relay_chat），让它判断论文究竟属于哪个方向、还是 not_relevant，
+（默认 relay 模型，复用 relay.relay_chat），让它判断论文究竟属于哪个方向、还是 not_relevant，
 并给出一句基于摘要的理由（便于人工核对，不编造）。
 
 - 多篇论文批量塞进一次调用；按 arxiv_id 回填结果（与顺序无关，稳健）。

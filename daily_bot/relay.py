@@ -3,7 +3,7 @@ relay —— 与 OpenAI 兼容 relay 的通用调用（供 digest 与 stage-B �
 
 配置从环境变量读取（daily_bot/.env 里的 RELAY_API_KEY 等，由 run.py 在启动时加载）：
   RELAY_API_KEY（必需，=A）、RELAY_API_KEY_2（可选，=B）、RELAY_API_KEY_3（可选，=C）、
-  RELAY_BASE_URL（默认 a6）、RELAY_MODEL（默认 claude-fable-5）。
+  RELAY_BASE_URL（默认 a6）、RELAY_MODEL（默认 gpt-5.6-sol）。
 env 在调用时读取（而非 import 时），确保 .env 已被 run.py 加载。
 
 多 key（最多 3 把）负载均衡（RELAY_API_KEY_2/_3 存在时启用；每把 key 在同一 relay 上各有独立的按-key 限流）：
@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 
 # 单一真源：relay 的默认模型与 base_url（run.py 等一律引用这里，避免默认值分叉）
-DEFAULT_MODEL = "claude-fable-5"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_BASE_URL = "https://a6.a6api.com/v1"
 
 COOLDOWN_S = 120                       # 某 key 抛 503/429 后冷却时长（其间优先另一把）
@@ -258,7 +258,7 @@ def relay_chat(system_prompt, user_prompt, temperature=0.3, timeout=90,
     发一条 system+user 消息，返回 (content, usage)。
     无 API key → 抛 RuntimeError；网络/HTTP/JSON 错误照常抛出，由调用方处理。
     max_tokens：可选，限制/放开输出长度（深度精读需要很长输出时传大值）。
-    model：可选，覆盖默认模型（用于按模型切换，如 claude-fable-5 / gpt-5.6-luna）。
+    model：可选，覆盖默认模型（用于按模型切换，如 gpt-5.6-sol / gpt-5.6-luna）。
 
     多 key（2/3 把）存在时：主动轮询 + 失败切换 + 120s 冷却（见模块 docstring）。
     单 key 时：仅尝试一次，异常/返回与从前逐字节一致（无切换/冷却/日志）。
