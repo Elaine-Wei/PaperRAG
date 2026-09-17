@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS daily_paper (
     arxiv_id        TEXT PRIMARY KEY REFERENCES papers(arxiv_id) ON DELETE CASCADE,
     -- 甲/乙 筛选结果
+    fetch_source    TEXT DEFAULT 'arxiv', -- arxiv | openalex-fallback
     area            TEXT,        -- stage-B 判定：options/cta/hft/quant/ai4math/lob/hpc/agent | not_relevant | NULL(未筛)
     filter_reason   TEXT,        -- 一句话理由
     is_relevant     BOOLEAN,     -- 便捷标志（area 属于关注方向）；未筛时为 NULL
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS daily_paper (
     score_path      TEXT,
     updated_at      TIMESTAMP DEFAULT NOW()
 );
+ALTER TABLE daily_paper ADD COLUMN IF NOT EXISTS fetch_source TEXT DEFAULT 'arxiv';
 CREATE INDEX IF NOT EXISTS idx_daily_paper_unfiltered
     ON daily_paper (filtered_at) WHERE filtered_at IS NULL;      -- 待筛队列
 CREATE INDEX IF NOT EXISTS idx_daily_paper_digest

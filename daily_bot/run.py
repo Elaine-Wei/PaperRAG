@@ -67,6 +67,7 @@ load_env_file()
 sys.path.insert(0, CRAWLER_DIR)  # 便于 paper_filter 复用 crawler/config.py
 import paper_filter
 import stage_b
+import openalex_fetch
 import relay
 import db  # 数据库层（Supabase）：ingest / 队列 / 持久化筛选结果
 
@@ -297,7 +298,7 @@ def _parse_with_regex(xml_data):
 
 
 def fetch_arxiv(query, max_results):
-    """单次 arXiv 查询，失败返回空列表（不抛异常）。"""
+    """单次 arXiv 查询，返回 (papers, error)，区分成功空结果与请求失败。"""
     params = {
         "search_query": query,
         "start": 0,
@@ -312,8 +313,8 @@ def fetch_arxiv(query, max_results):
             data = resp.read()
     except Exception as e:
         print(f"[WARN] fetch_arxiv 失败 (query={query!r}): {e}")
-        return []
-    return parse_arxiv_xml(data)
+        return [], e
+    return parse_arxiv_xml(data), None
 
 
 def fetch_recent_papers(queries, per_query=FETCH_PER_QUERY):
@@ -323,7 +324,17 @@ def fetch_recent_papers(queries, per_query=FETCH_PER_QUERY):
     """
     collected = {}
     for i, query in enumerate(queries):
-        batch = fetch_arxiv(query, per_query)
+        batch, error = fetch_arxiv(query, per_query)
+        if error is not None:
+            try:
+                batch, counts = openalex_fetch.fetch_fallback(query)
+                print(f"[fetch][openalex-fallback] query={query} results={counts['results']} "
+                      f"accepted={counts['accepted']} "
+                      f"discarded_no_arxiv_id={counts['discarded_no_arxiv_id']} "
+                      f"duplicate_arxiv_ids={counts['duplicate_arxiv_ids']}")
+            except Exception as e:
+                batch = []
+                print(f"[WARN] OpenAlex fallback 失败 (query={query!r}): {e}")
         for p in batch:
             collected.setdefault(p["arxiv_id"], p)
         print(f"[fetch] query 命中 {len(batch)} 篇（累计去重 {len(collected)} 篇）: {query}")
@@ -1575,14 +1586,15 @@ def main():
         print("== Step 1: 抓取 + 入库（ingest）==")
         papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
         print(f"[fetch] 抓取 {len(papers)} 篇（去重后）")
-        # 抓取要跑好几分钟（每 query 间隔 3s + 超时重试），期间无 DB 流量 → Supabase pooler
+        # 抓取要跑好几分钟（每 query 间隔 3s；请求失败不重试），期间无 DB 流量 → Supabase pooler
         # 会把这条连接关掉，ingest 第一次写就 "server closed the connection unexpectedly"。
         # 与其它"长操作后再写库"的点一样，写前先 ensure（ping/重连）。
         conn = db.ensure(conn)
         new = 0
         for p in papers:
             db.upsert_paper(conn, p)                       # 写入共享 papers（冲突忽略）
-            if db.upsert_daily_paper(conn, p["arxiv_id"]):  # 新建 daily_paper 行（阶段时间戳全 NULL）
+            if db.upsert_daily_paper(conn, p["arxiv_id"],
+                                     p.get("fetch_source") or "arxiv"):
                 new += 1
         print(f"[ingest] 新登记 daily_paper {new} 篇；其余 {len(papers) - new} 篇已存在（增量，跳过）")
 

@@ -74,12 +74,12 @@ def upsert_paper(conn, paper):
     insert_paper(conn, paper)  # 内部已 commit
 
 
-def upsert_daily_paper(conn, arxiv_id):
+def upsert_daily_paper(conn, arxiv_id, fetch_source="arxiv"):
     """登记一篇进入 daily_bot 流水线（已存在则忽略）。返回是否为新登记。"""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO daily_paper (arxiv_id) VALUES (%s) "
-            "ON CONFLICT (arxiv_id) DO NOTHING;", (arxiv_id,))
+            "INSERT INTO daily_paper (arxiv_id, fetch_source) VALUES (%s, %s) "
+            "ON CONFLICT (arxiv_id) DO NOTHING;", (arxiv_id, fetch_source))
         new = cur.rowcount == 1
     conn.commit()
     return new
@@ -393,7 +393,7 @@ def get_stage_status(conn, arxiv_id):
 
 def get_daily_row(conn, arxiv_id):
     """取 daily_paper 一行（area / 各产物路径），供组装用。"""
-    cols = ["arxiv_id", "area", "is_relevant", "digest_path", "deep_study_path",
+    cols = ["arxiv_id", "area", "fetch_source", "is_relevant", "digest_path", "deep_study_path",
             "score_path"]
     with conn.cursor() as cur:
         cur.execute(f"SELECT {', '.join(cols)} FROM daily_paper WHERE arxiv_id=%s;",
