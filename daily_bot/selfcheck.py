@@ -73,7 +73,7 @@ def gather():
     r["daily_pool"] = getattr(run, "MODEL_ROTATION", None)
     r["topic_pool"] = getattr(run_topic, "MODEL_ROTATION", None)
     # 默认深读模型（rotation OFF 时实际所用）
-    r["daily_default"] = deep_study.DEFAULT_MODEL           # daily OFF → paper_model=DEFAULT_MODEL
+    r["daily_default"] = deep_study.DEFAULT_MODEL           # rotation OFF 时 → paper_model=DEFAULT_MODEL
     r["topic_default"] = getattr(run_topic, "STUDY_MODEL", None)  # topic OFF → STUDY_MODEL
     return r
 

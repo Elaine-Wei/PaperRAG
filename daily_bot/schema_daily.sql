@@ -97,3 +97,26 @@ CREATE TABLE IF NOT EXISTS daily_top30_push (
     pushed_at  TIMESTAMP DEFAULT NOW(),
     detail     TEXT
 );
+
+-- Score/study split handoff. A completed score run is the exact candidate
+-- manifest consumed by the later --study-only invocation.
+CREATE TABLE IF NOT EXISTS daily_top30_run (
+    run_id       TEXT PRIMARY KEY,
+    mode         TEXT NOT NULL, -- 'score' | 'study'
+    status       TEXT NOT NULL, -- 'running' | 'completed' | 'failed'
+    window_days  INTEGER NOT NULL,
+    study_top    INTEGER NOT NULL,
+    started_at   TIMESTAMP DEFAULT NOW(),
+    completed_at TIMESTAMP,
+    detail       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_top30_run_paper (
+    run_id          TEXT NOT NULL REFERENCES daily_top30_run(run_id) ON DELETE CASCADE,
+    arxiv_id        TEXT NOT NULL REFERENCES papers(arxiv_id) ON DELETE CASCADE,
+    rank            INTEGER NOT NULL,
+    composite_score NUMERIC(3,1),
+    PRIMARY KEY (run_id, arxiv_id)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_top30_run_paper_rank
+    ON daily_top30_run_paper (run_id, rank);

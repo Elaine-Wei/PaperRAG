@@ -336,6 +336,34 @@ def get_window_batch(conn, days=7):
                 for r in cur.fetchall()]
 
 
+def get_monthly_rising_batch(conn, min_age=8, max_age=30):
+    """本月潜力榜候选：严格取年龄 min_age..max_age 天的相关论文。
+
+    Both bounds are inclusive, so this is disjoint from the weekly 0..7-day
+    pool when called with the defaults (8..30 days inclusive).
+    Ranking still uses the stored daily composite and follows the weekly
+    board's ordering rules; scoring/study/delivery remain caller-owned.
+    """
+    if min_age < 0 or max_age < min_age:
+        raise ValueError("invalid monthly rising age range")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT dp.arxiv_id, dp.area, pa.published, ds.composite_score
+            FROM daily_paper dp
+            JOIN papers pa ON pa.arxiv_id = dp.arxiv_id
+            LEFT JOIN daily_score ds ON ds.arxiv_id = dp.arxiv_id
+            WHERE dp.is_relevant IS TRUE
+              AND pa.published <= ((NOW() AT TIME ZONE 'Asia/Hong_Kong')::date - %s)
+              AND pa.published >= ((NOW() AT TIME ZONE 'Asia/Hong_Kong')::date - %s)
+            ORDER BY ds.composite_score DESC NULLS LAST,
+                     pa.published DESC, dp.arxiv_id DESC;
+            """, (min_age, max_age))
+        return [{"arxiv_id": r[0], "area": r[1], "published": r[2],
+                 "composite": float(r[3]) if r[3] is not None else None}
+                for r in cur.fetchall()]
+
+
 def get_top30_batch(conn, limit=30):
     """当日 top-N 候选：相关论文，按最新（published 降序）取 limit 篇。不按是否推送过过滤——
     这是每日榜单，可重复生成；打分/综评/深读/推送各自增量去重。"""
@@ -415,6 +443,72 @@ def get_score(conn, arxiv_id):
                     (arxiv_id,))
         r = cur.fetchone()
         return dict(zip(cols, r)) if r else None
+
+
+def create_top30_run(conn, run_id, mode, window_days, study_top):
+    """Create a score/study handoff manifest and return its id."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO daily_top30_run
+               (run_id, mode, status, window_days, study_top)
+               VALUES (%s, %s, 'running', %s, %s);""",
+            (run_id, mode, window_days, study_top))
+    conn.commit()
+    return run_id
+
+
+def record_top30_run_papers(conn, run_id, ranked, composites):
+    """Persist the ranked paper set for a completed score run."""
+    with conn.cursor() as cur:
+        for rank, aid in enumerate(ranked, 1):
+            cur.execute(
+                """INSERT INTO daily_top30_run_paper
+                   (run_id, arxiv_id, rank, composite_score)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (run_id, arxiv_id) DO UPDATE SET
+                     rank=EXCLUDED.rank,
+                     composite_score=EXCLUDED.composite_score;""",
+                (run_id, aid, rank, composites.get(aid)))
+    conn.commit()
+
+
+def finish_top30_run(conn, run_id, status="completed", detail=None):
+    """Mark a handoff manifest completed or failed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE daily_top30_run
+               SET status=%s, completed_at=NOW(), detail=%s
+               WHERE run_id=%s;""", (status, detail, run_id))
+    conn.commit()
+
+
+def get_latest_top30_score_run(conn, window_days=None):
+    """Return the newest completed score-run manifest and its ranked papers."""
+    with conn.cursor() as cur:
+        if window_days is None:
+            cur.execute(
+                """SELECT run_id, window_days, study_top, started_at, completed_at
+                   FROM daily_top30_run
+                   WHERE mode='score' AND status='completed'
+                   ORDER BY completed_at DESC LIMIT 1;""")
+        else:
+            cur.execute(
+                """SELECT run_id, window_days, study_top, started_at, completed_at
+                   FROM daily_top30_run
+                   WHERE mode='score' AND status='completed' AND window_days=%s
+                   ORDER BY completed_at DESC LIMIT 1;""", (window_days,))
+        run = cur.fetchone()
+        if not run:
+            return None
+        cur.execute(
+            """SELECT arxiv_id, rank, composite_score
+               FROM daily_top30_run_paper
+               WHERE run_id=%s ORDER BY rank;""", (run[0],))
+        papers = [{"arxiv_id": r[0], "rank": r[1],
+                   "composite": float(r[2]) if r[2] is not None else None}
+                  for r in cur.fetchall()]
+    return {"run_id": run[0], "window_days": run[1], "study_top": run[2],
+            "started_at": run[3], "completed_at": run[4], "papers": papers}
 
 
 # ---------------------------------------------------------------------------

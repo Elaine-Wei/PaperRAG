@@ -5,7 +5,11 @@ import requests
 
 from config import ARXIV_BATCH_SIZE, ARXIV_DELAY
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_HEADERS = {
+    "User-Agent": "PaperRAG/1.0 (mailto:elaine.wei@xpef.org)",
+    "Accept": "application/atom+xml",
+}
 
 NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -105,7 +109,8 @@ def fetch_arxiv(query, start, max_results):
         "sortOrder": "descending",
     }
     try:
-        resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
+        resp = requests.get(ARXIV_API_URL, params=params,
+                            headers=ARXIV_HEADERS, timeout=30)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"[WARN] fetch_arxiv: 请求失败 (start={start}): {e}")

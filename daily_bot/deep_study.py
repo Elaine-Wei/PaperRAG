@@ -2,7 +2,7 @@
 """
 deep_study —— 单篇论文的深度精读讲义生成器（独立能力，与每日 digest 无关）。
 
-多趟（multi-pass）流水线（默认 gpt-5.6-luna，复用 relay.py）：
+多趟（multi-pass）流水线（默认 gpt-5.6-sol；daily deep-study 可按 paper 轮换模型，复用 relay.py）：
   Pass 1（大纲）：全文 + 检测到的原文小节标签 → 让模型规划「大教学章节」并映射到原文小节。
   Pass 2（逐节讲解）：按原文结构切块，对每个原文小节单独讲解，逐字保存。
   Pass 3（衔接）：对每个大章节，只让模型写 intro/outro/过渡句；正文由「代码」拼接 Pass-2
@@ -27,6 +27,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import requests
+
 # 复用 run.py（导入即加载 daily_bot/.env、arXiv 解析器）与共享 relay
 import run
 import relay
@@ -39,15 +41,18 @@ CSS_PATH = os.path.join(PROJECT_ROOT, "academic-html-skill", "unpacked",
 OUTPUT_DIR = os.path.join(HERE, "output")
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, ".checkpoint")  # 断点续跑：每(论文,模型)一个 json
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
-UA = {"User-Agent": "PaperRAG-deep-study/0 (mailto:elaine.wei@xpef.org)"}
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+UA = {
+    "User-Agent": "PaperRAG/1.0 (mailto:elaine.wei@xpef.org)",
+    "Accept": "application/atom+xml",
+}
 
 # 全文字符上限（安全阀；正常论文远小于此，超出才截断并提示）。不担心 token 成本。
 MAX_TEXT_CHARS = 600_000
 
-# 模型：默认 gpt-5.6-luna（须能完整生成长的多趟输出而不被 relay 静默截断；
+# 模型：默认 sol（luna 已重新通过完整输出验证，并纳入 run.py 的逐-paper 轮换池；
 # 可用第二个位置参数 / 环境变量 DEEP_STUDY_MODEL 覆盖切换。
-DEFAULT_MODEL = "gpt-5.6-sol"   # 深读默认模型（luna 返回坏包 → 改 sol；luna 确认健康前仅显式 opt-in）
+DEFAULT_MODEL = "gpt-5.6-sol"   # 深读默认模型；轮换开启时由调用方按 paper 分配模型
 
 # 输出上限：深度精读很长，放开到 60k。不同模型的实际上限可能不同——
 # 若模型拒绝过大的 max_tokens（HTTP 400），按 OUTPUT_TOKENS_LADDER 自动降档重试。
@@ -63,9 +68,9 @@ def fetch_metadata(arxiv_id):
     """按 id 查 arXiv，拿到 title/authors/abstract/pdf_url（复用 run 的 XML 解析）。"""
     url = ARXIV_API_URL + "?" + urllib.parse.urlencode(
         {"id_list": arxiv_id, "max_results": 1})
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = r.read()
+    response = requests.get(url, headers=UA, timeout=30)
+    response.raise_for_status()
+    data = response.content
     papers = run.parse_arxiv_xml(data)
     return papers[0] if papers else None
 
@@ -76,10 +81,10 @@ def download_pdf(pdf_url, tries=4):
     last = None
     for k in range(tries):
         try:
-            req = urllib.request.Request(pdf_url, headers=UA)
-            with urllib.request.urlopen(req, timeout=180) as r:
-                clen = r.headers.get("Content-Length")
-                data = r.read()
+            response = requests.get(pdf_url, headers=UA, timeout=180)
+            response.raise_for_status()
+            clen = response.headers.get("Content-Length")
+            data = response.content
             if clen is not None and data and len(data) < int(clen):
                 raise IOError(f"下载不完整：{len(data)}/{clen} 字节")
             if not data:

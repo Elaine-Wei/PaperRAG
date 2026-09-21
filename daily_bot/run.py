@@ -15,9 +15,12 @@ import os
 import re
 import sys
 import time
+import uuid
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+
+import requests
 
 # ---------------------------------------------------------------------------
 # 路径 / 配置
@@ -78,9 +81,10 @@ RELAY_MODEL = os.environ.get("RELAY_MODEL", relay.DEFAULT_MODEL)
 
 # 逐-paper（非逐-call）研究模型交替（与 run_topic.py 同机制）：每篇深读全程单一模型
 # （outline+sections+theme 同一模型），仅在论文【之间】按稳定下标交替；跨 backoff 重试稳定。
-# 默认【关闭】=全 sol（安全已验证态）；--model-rotation 可临时开启 sol↔terra 摊负载。
-MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
-STUDY_MODEL_ROTATION = False
+# 默认开启逐-paper 四模型轮换；同一篇论文全程仍固定使用一次分配的模型。
+# deepseek-v4.1-flash 是普通 relay model；relay.DS_MODEL_TAG（ds-direct）仍是独立的直连兜底路径。
+MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4.1-flash"]
+STUDY_MODEL_ROTATION = True
 
 # DS 自动兜底总开关（机制 A/B）：relay 调用失败时是否自动改试 DeepSeek 直连一次。
 # 默认【关闭】——2026-09 relay 恢复三键轮换后，DS 稳定性本身存疑（曾 402/429），
@@ -123,7 +127,11 @@ def _composite_model(sc=None):
     return _score_model()
 
 # arXiv
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_HEADERS = {
+    "User-Agent": "PaperRAG/1.0 (mailto:elaine.wei@xpef.org)",
+    "Accept": "application/atom+xml",
+}
 ARXIV_DELAY = 3.0  # arXiv 要求请求间隔 ≥ 3 秒
 NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -308,9 +316,9 @@ def fetch_arxiv(query, max_results):
     }
     url = ARXIV_API_URL + "?" + urllib.parse.urlencode(params)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "PaperRAG-daily-bot/0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+        response = requests.get(url, headers=ARXIV_HEADERS, timeout=30)
+        response.raise_for_status()
+        data = response.content
     except Exception as e:
         print(f"[WARN] fetch_arxiv 失败 (query={query!r}): {e}")
         return [], e
@@ -1245,7 +1253,23 @@ def _top30_dry_run(conn, window, study_top, window_days):
             "targets": targets, "dry_run": True}
 
 
-def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False, model_rotation=None):
+def monthly_rising_dry_run(conn, top_n=10, min_age=8, max_age=30):
+    """Read-only preview of the disjoint 8..30-day board using stored scores."""
+    window = db.get_monthly_rising_batch(conn, min_age=min_age, max_age=max_age)
+    print("\n===== DRY-RUN 本月潜力榜（只读库，无 LLM/推送/精读）=====")
+    print(f"年龄范围 {min_age}-{max_age} 天，候选 {len(window)} 篇；weekly 0-7 天不参与\n")
+    print(f"  {'#':>2}  {'arxiv_id':11} {'published':11} {'age':>3} {'comp':>5}  {'area':7}")
+    today = datetime.date.today()
+    for i, paper in enumerate(window[:top_n], 1):
+        age = (today - paper["published"]).days if paper["published"] else None
+        comp = f"{paper['composite']:.1f}" if paper["composite"] is not None else "N/A"
+        print(f"  {i:>2}  {paper['arxiv_id']:11} {str(paper['published']):11} "
+              f"{str(age) if age is not None else '-':>3} {comp:>5}  {str(paper['area']):7}")
+    return {"candidates": len(window), "top": window[:top_n], "dry_run": True}
+
+
+def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False,
+              model_rotation=None, score_only=False, study_only=False):
     """
     每日榜单（滚动窗口）：窗口=最近 window_days 天内所有【相关】论文（数量自然浮动，不再固定 30）→
     真实 5 维打分（增量）→ 综评 0-10（增量）→ 按综评降序 →
@@ -1254,33 +1278,61 @@ def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False, model
     """
     import assemble
     import wecom
+    if score_only and study_only:
+        raise ValueError("--score-only and --study-only are mutually exclusive")
+    if dry_run and (score_only or study_only):
+        raise ValueError("stage-only flags cannot be combined with --top30-dry-run")
+
     conn = db.ensure(conn)
-    window = db.get_window_batch(conn, window_days)
-    if not window:
-        print(f"  最近 {window_days} 天窗口内无相关论文。")
-        return {"candidates": 0}
-    ids = [w["arxiv_id"] for w in window]
-    print(f"[top30] 窗口={window_days}天，相关论文 {len(ids)} 篇"
-          f"（发表 {min(str(w['published']) for w in window)}"
-          f"..{max(str(w['published']) for w in window)}）")
+    manifest = None
+    if study_only:
+        manifest = db.get_latest_top30_score_run(conn, window_days=window_days)
+        if not manifest:
+            print(f"[top30][study-only] 没有找到最近完成的 {window_days} 天 score run。")
+            return {"candidates": 0, "studied": [], "pushed": {"message": False}}
+        ranked = [p["arxiv_id"] for p in manifest["papers"]]
+        comps = {p["arxiv_id"]: p["composite"] for p in manifest["papers"]}
+        ids = ranked
+        print(f"[top30][study-only] 读取 score run {manifest['run_id']}："
+              f"{len(ids)} 篇（完成于 {manifest['completed_at']}）")
+    else:
+        window = db.get_window_batch(conn, window_days)
+        if not window:
+            print(f"  最近 {window_days} 天窗口内无相关论文。")
+            return {"candidates": 0}
+        ids = [w["arxiv_id"] for w in window]
+        print(f"[top30] 窗口={window_days}天，相关论文 {len(ids)} 篇"
+              f"（发表 {min(str(w['published']) for w in window)}"
+              f"..{max(str(w['published']) for w in window)}）")
 
     if dry_run:
         return _top30_dry_run(conn, window, study_top, window_days)
 
-    # 1) 打分（增量） 2) 综评（增量）
-    print("\n[top30] 打分（scorer.generate_score，增量）…")
-    for aid in ids:
-        conn, _ = _ensure_score(conn, aid)
-    print("\n[top30] 综评（composite，增量）…")
-    for aid in ids:
-        conn, _ = _ensure_composite(conn, aid)
-    # 3) 按综评（最新读回）降序，N/A 置底
-    comps = {}
-    for aid in ids:
-        sc = db.get_score(conn, aid)
-        comps[aid] = (float(sc["composite_score"])
-                      if sc and sc.get("composite_score") is not None else None)
-    ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
+    if not study_only:
+        # 1) 打分（增量） 2) 综评（增量）
+        print("\n[top30] 打分（scorer.generate_score，增量）…")
+        for aid in ids:
+            conn, _ = _ensure_score(conn, aid)
+        print("\n[top30] 综评（composite，增量）…")
+        for aid in ids:
+            conn, _ = _ensure_composite(conn, aid)
+        # 3) 按综评（最新读回）降序，N/A 置底
+        comps = {}
+        for aid in ids:
+            sc = db.get_score(conn, aid)
+            comps[aid] = (float(sc["composite_score"])
+                          if sc and sc.get("composite_score") is not None else None)
+        ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
+
+        if score_only:
+            run_id = f"top30-score-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            db.create_top30_run(conn, run_id, "score", window_days, study_top)
+            db.record_top30_run_papers(conn, run_id, ranked, comps)
+            db.finish_top30_run(conn, run_id, "completed", f"{len(ranked)} ranked papers")
+            print(f"[top30][score-only] 完成 score run {run_id}：{len(ranked)} 篇；不深读、不推送。")
+            return {"candidates": len(ids), "ranked": ranked, "comps": comps,
+                    "run_id": run_id, "studied": [],
+                    "pushed": {"message": False, "uploaded": 0}}
     # 4) 精读目标 = 综评最高、尚未【完整】精读的 study_top 篇（跳过已精读，向下顺延）
     prev_studied = [a for a in ranked if _is_study_complete(conn, a)]
     prev_set = set(prev_studied)
@@ -1570,7 +1622,13 @@ def main():
     top30_fetch = _arg_int("--top30-fetch", 30)      # 保留：滚动窗口下不再用于选择，无害
     top30_study = _arg_int("--top30-study", 6)
     top30_window = _arg_int("--top30-window", 7)      # 滚动窗口天数
-    # 模型轮换开关：显式 CLI 覆盖模块常量 STUDY_MODEL_ROTATION；都没给则用常量（默认 OFF=全 sol）
+    top30_score_only = "--score-only" in sys.argv
+    top30_study_only = "--study-only" in sys.argv
+    if top30_score_only and top30_study_only:
+        raise SystemExit("--score-only 与 --study-only 不能同时使用")
+    if (top30_score_only or top30_study_only) and not top30_mode:
+        raise SystemExit("--score-only/--study-only 需要与 --top30 一起使用")
+    # 模型轮换开关：显式 CLI 覆盖模块常量 STUDY_MODEL_ROTATION；都没给则用常量（默认 ON）
     model_rotation = None
     if "--no-model-rotation" in sys.argv:
         model_rotation = False
@@ -1581,7 +1639,9 @@ def main():
     db.ensure_schema(conn)  # 幂等，确保表就位
 
     # dry-run：只读库，跳过抓取(Step1)与筛选(Step2，会调 relay)，直接进榜单 dry-run
-    if not top30_dry:
+    # --study-only consumes the completed score manifest and must not refresh
+    # the upstream corpus or invoke filtering again.
+    if not top30_dry and not top30_study_only:
         # ---- Step 1: 抓取 + 入库（ingest）----
         print("== Step 1: 抓取 + 入库（ingest）==")
         papers = fetch_recent_papers(paper_filter.FETCH_QUERIES)
@@ -1617,22 +1677,39 @@ def main():
     # ---- Step 3（模式分支）----
     if top30_mode:
         # 滚动窗口榜单模式（dry-run 只读库、不调 LLM/推送）
-        mode_txt = "DRY-RUN" if top30_dry else "打分→综评→排序→深读→概览→推送"
+        if top30_dry:
+            mode_txt = "DRY-RUN"
+        elif top30_score_only:
+            mode_txt = "ingest→筛选→打分→综评"
+        elif top30_study_only:
+            mode_txt = "读取夜间 score run→深读→概览→推送"
+        else:
+            mode_txt = "打分→综评→排序→深读→概览→推送"
         print(f"\n== Step 3: 滚动窗口榜单（{top30_window}天 · {mode_txt}）==")
         conn = db.ensure(conn)
         t = run_top30(conn, fetch_n=top30_fetch, study_top=top30_study,
                       window_days=top30_window, dry_run=top30_dry,
-                      model_rotation=model_rotation)
+                      model_rotation=model_rotation,
+                      score_only=top30_score_only,
+                      study_only=top30_study_only)
         if not top30_dry:
             print("\n== Top 榜单结果 ==")
             if t.get("candidates", 0) == 0:
                 print("  窗口内无候选。")
             else:
                 p = t["pushed"]
-                print(f"  窗口 {t['candidates']} 篇；今日新精读 {len(t['studied'])} 篇；概览 {t['overview_path']}")
-                print(f"  交付：COS 上传 {p.get('uploaded', 0)} 个（失败 {p.get('failed', 0)}），"
-                      f"链接消息 {'成功' if p.get('message') else ('今日已推/跳过' if p.get('skipped') else '失败/未推')}。")
-            print("\n[done] 滚动窗口榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
+                if top30_score_only:
+                    print(f"  夜间 score run {t.get('run_id')}：{t['candidates']} 篇；未深读、未推送。")
+                else:
+                    print(f"  窗口 {t['candidates']} 篇；今日新精读 {len(t['studied'])} 篇；概览 {t.get('overview_path')}")
+                    print(f"  交付：COS 上传 {p.get('uploaded', 0)} 个（失败 {p.get('failed', 0)}），"
+                          f"链接消息 {'成功' if p.get('message') else ('今日已推/跳过' if p.get('skipped') else '失败/未推')}。")
+            if top30_score_only:
+                print("\n[done] 夜间阶段：ingest → 筛选 → 打分 → 综评 → score manifest。")
+            elif top30_study_only:
+                print("\n[done] 日间阶段：score manifest → 深读 → 概览 → COS/WeCom。")
+            else:
+                print("\n[done] 滚动窗口榜单：ingest → 筛选 → 打分 → 综评 → 排序 → 深读 → 概览 → 推送。")
         conn.close()
         return
 

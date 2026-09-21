@@ -21,7 +21,8 @@ import re
 import sys
 import time
 import urllib.parse
-import urllib.request
+
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run          # noqa: E402  加载 .env + parse_arxiv_xml + 复用 _classify_study_error 等
@@ -29,9 +30,13 @@ import db           # noqa: E402
 import scorer       # noqa: E402
 import deep_study   # noqa: E402
 
-ARXIV_API = "http://export.arxiv.org/api/query"
-STUDY_MODEL = "gpt-5.6-sol"      # deep-study + theme-summary（luna 宕机）
-CROSS_MODEL = "gpt-5.6-sol"      # 交叉复核走 sol（luna 宕机；daily 默认不变）
+ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_HEADERS = {
+    "User-Agent": "PaperRAG/1.0 (mailto:elaine.wei@xpef.org)",
+    "Accept": "application/atom+xml",
+}
+STUDY_MODEL = "gpt-5.6-sol"      # deep-study + theme-summary（legacy 默认保持 sol；luna 已恢复验证）
+CROSS_MODEL = "gpt-5.6-sol"      # 交叉复核走 sol（legacy 默认保持不变）
 CLF_MODEL = "gpt-5.6-sol"       # LLM-or-not 分类
 # 经典区 relaxed freshness（center=365, scale=600）——老经典不被压到 1（AlphaGen 1125d≈2.3）；待学长最终确认
 RELAXED = {"fresh_center": 365, "fresh_scale": 600}
@@ -65,9 +70,9 @@ def _get(url, tries=3):
     """arXiv API 偶发慢/超时 → 重试；仍失败返回 None（调用方跳过该查询，不崩溃整轮）。"""
     for k in range(tries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PaperRAG-boards/0"})
-            with urllib.request.urlopen(req, timeout=45) as r:
-                return r.read()
+            response = requests.get(url, headers=ARXIV_HEADERS, timeout=45)
+            response.raise_for_status()
+            return response.content
         except Exception as e:
             print(f"    [arxiv] 取数失败({str(e)[:35]})，重试 {k + 1}/{tries}", flush=True)
             time.sleep(5 * (k + 1))
