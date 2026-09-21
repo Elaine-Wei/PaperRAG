@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deep_study as ds  # noqa: E402  （只读复用）
 import relay            # noqa: E402
 
-DEFAULT_MODEL = "gpt-5.6-sol"   # 实验用：sol 今日在线且质量好（luna 全天 503-dead）
+DEFAULT_MODEL = "gpt-5.6-sol"   # 实验默认保持 sol；luna 已重新通过完整输出验证
 _BEG = re.compile(r"请粘贴|请提供|暂未提供|请补充", re.I)
 
 

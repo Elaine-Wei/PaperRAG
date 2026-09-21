@@ -1,0 +1,46 @@
+{
+  "topic": "options",
+  "verified_anchors": [
+    {
+      "arxiv_id": "1901.09647",
+      "title": "Deep Learning Volatility",
+      "authors": ["Blanka Horvath", "Aitor Muguruza", "Mehdi Tomas"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    },
+    {
+      "arxiv_id": "1911.05620",
+      "title": "Neural networks for option pricing and hedging: a literature review",
+      "authors": ["Johannes Ruf", "Weiguan Wang"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    }
+  ],
+  "keyword_nets": [
+    {
+      "label": "options-and-volatility",
+      "queries": [
+        "option",
+        "options",
+        "option pricing",
+        "implied volatility",
+        "volatility surface",
+        "volatility smile",
+        "option hedging",
+        "option portfolio",
+        "option strategy",
+        "(ti:\"option pricing\" OR ti:options OR abs:\"implied volatility\" OR abs:\"volatility surface\")"
+      ],
+      "coverage": "期权定价、对冲、隐含波动率、波动率曲面与期权策略"
+    }
+  ],
+  "copy_ready_snippet": {
+    "SEEDS": ["1901.09647", "1911.05620"],
+    "ANCHORS": [],
+    "KW": [
+      "option", "options", "option pricing", "implied volatility", "volatility surface",
+      "volatility smile", "option hedging", "option portfolio", "option strategy",
+      "(ti:\"option pricing\" OR ti:options OR abs:\"implied volatility\" OR abs:\"volatility surface\")"
+    ]
+  }
+}

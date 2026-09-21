@@ -27,16 +27,17 @@ import db             # noqa: E402
 import scorer         # noqa: E402
 import deep_study     # noqa: E402
 import run_boards     # noqa: E402  复用 fetch_ids / fetch_search / _get
+import topic_config   # noqa: E402  配置驱动主题（legacy selfevo 无配置时不启用）
 
-STUDY_MODEL = "gpt-5.6-sol"      # 深读 + theme-summary（luna 宕机）
+STUDY_MODEL = "gpt-5.6-sol"      # 深读 + theme-summary（legacy 默认保持 sol；luna 已恢复验证）
 CROSS_MODEL = "gpt-5.6-sol"      # 交叉复核走 sol
 JUDGE_MODEL = "gpt-5.6-sol"      # keep/drop 判定 + 重要性预排
-# 主评分：本主题改用 sol。原因：fable-5 经 relay 在大评分 prompt 上持续返回空(empty-score 守卫拦截)，
-# 而 luna 宕机——sol 是唯一健康主模型。副作用：交叉复核变同族(sol 自审)，暂无异构复核（fable-5 恢复后可重评）。
+# 主评分：本主题继续使用 sol。fable-5 经 relay 在大评分 prompt 上持续返回空，
+# luna 已恢复验证但本主题 legacy 默认仍保持 sol；交叉复核仍为同族(sol 自审)。
 SCORE_MAIN = "gpt-5.6-sol"
 # 逐-paper（非逐-call）研究模型交替：把不同论文分摊到不同模型后端（sol-wide 抖动未必命中 terra）。
 # 每篇研究全程单一模型（风格一致），仅在论文【之间】交替；同一篇的所有 pass 用同一模型。
-# 默认【关闭】（全 sol）——terra 研究质量验证通过前保持安全态；CLI --model-rotation 可临时开启。
+# 默认【关闭】（全 sol）——本主题 legacy 行为保持不变；CLI --model-rotation 可临时开启轮换。
 MODEL_ROTATION = ["gpt-5.6-sol", "gpt-5.6-terra"]
 STUDY_MODEL_ROTATION = False
 FOUNDATIONAL_DAYS = 365          # 锚点若早于 today-此天数 → 归入「🌱 奠基之作」不参与排名
@@ -84,8 +85,34 @@ _TOPIC_RE = re.compile(
     r"(agent|agentic|self[- ]?evolv|self[- ]?improv|self[- ]?play|lifelong|recursive self|"
     r"co[- ]?evolution|\bLLM\b|large language model|language model|智能体|自进化|自我改进|自我进化)", re.I)
 
+ACTIVE_TOPIC_CONFIG = None
+
+
+def _activate_topic_config(config):
+    """Install one validated config topic for this process only.
+
+    With no config entry, the existing module constants remain untouched and
+    selfevo follows its original path byte-for-byte in behavior.
+    """
+    global ACTIVE_TOPIC_CONFIG, FOUNDATIONAL_DAYS, TOPIC_LABEL
+    global SEEDS, ANCHORS, VERIFIED, _EXPECT_KW, KW, _TOPIC_RE
+    global _JUDGE_SYS, _IMPORTANCE_SYS
+    ACTIVE_TOPIC_CONFIG = config
+    FOUNDATIONAL_DAYS = config["foundational_days"]
+    TOPIC_LABEL[config["topic"]] = config["label"]
+    SEEDS = config["seeds"]
+    ANCHORS = config["anchors"]
+    VERIFIED = config["verified"]
+    _EXPECT_KW = config["expected_keywords"]
+    KW = config["keywords"]
+    _TOPIC_RE = config["prefilter_pattern"]
+    _JUDGE_SYS = config["judge_system"]
+    _IMPORTANCE_SYS = config["importance_system"]
+
 
 def _prefilter(meta):
+    if ACTIVE_TOPIC_CONFIG is not None:
+        return bool(_TOPIC_RE.search(f"{meta.get('title','')} {meta.get('abstract','')}"))
     if any((c or "").startswith("cs.") for c in (meta.get("categories") or [])):
         return True
     return bool(_TOPIC_RE.search(f"{meta.get('title','')} {meta.get('abstract','')}"))
@@ -106,13 +133,14 @@ def judge_topic(meta, model=None):
     """sol 一次调用做 keep/drop：{is_self_evolving_agent, reason}。503 退避重试。"""
     import relay
     model = model or JUDGE_MODEL   # 调用时解析：--ds 会改写模块级常量
+    result_key = "is_topic" if ACTIVE_TOPIC_CONFIG is not None else "is_self_evolving_agent"
     user = f"标题：{meta.get('title')}\n摘要：{(meta.get('abstract') or '')[:1400]}"
     for k in range(3):
         try:
             content, _ = relay.relay_chat(_JUDGE_SYS, user, temperature=0, model=model, max_tokens=200)
             obj = relay.extract_json(content)
-            if obj is not None and "is_self_evolving_agent" in obj:
-                return bool(obj.get("is_self_evolving_agent")), (obj.get("reason") or "").strip()
+            if obj is not None and result_key in obj:
+                return bool(obj.get(result_key)), (obj.get("reason") or "").strip()
         except Exception as e:
             print(f"    [judge] {meta.get('arxiv_id')} 异常({str(e)[:35]})，退避 {k+1}/3", flush=True)
             time.sleep(20 * (k + 1))
@@ -436,8 +464,11 @@ def score_one(conn, topic, aid):
         "domain_relevance": (res.get("domain_relevance") or {}).get("score"),
         "authority": ("N/A" if auth.get("na") else auth.get("score")),
     }
-    # 综评必须跟随 score 用同一个模型：否则 DS 兜底时这最后一步仍会打到已经死掉的 relay
-    composite = scorer.generate_composite(meta, sub, model=model_used)
+    if ACTIVE_TOPIC_CONFIG is not None:
+        composite = scorer.weighted_composite(sub, ACTIVE_TOPIC_CONFIG["weights"])
+    else:
+        # 综评必须跟随 score 用同一个模型：否则 DS 兜底时这最后一步仍会打到已经死掉的 relay
+        composite = scorer.generate_composite(meta, sub, model=model_used)
     conn2 = db.ensure(conn)
     _persist_score(conn2, topic, aid, res, composite, model_used)
     return composite
@@ -854,15 +885,18 @@ def main():
               "[--top-n 10] [--study-top 3] [--window-years 2] [--refresh-pool] [--webhook URL]")
         sys.exit(1)
     topic = args[args.index("--topic") + 1].strip()
+    config = topic_config.load_topic(topic)
+    if config is not None:
+        _activate_topic_config(config)
 
     def _argi(name, d):
         return int(args[args.index(name) + 1]) if name in args else d
     def _args(name, d):
         return args[args.index(name) + 1] if name in args else d
-    top_n = _argi("--top-n", 10)
-    study_top = _argi("--study-top", 3)
+    top_n = _argi("--top-n", config["top_n"] if config else 10)
+    study_top = _argi("--study-top", config["study_top"] if config else 3)
     window_years = _argi("--window-years", 2)
-    shortlist_top = _argi("--shortlist-top", 30)
+    shortlist_top = _argi("--shortlist-top", config["shortlist_top"] if config else 30)
     refresh = "--refresh-pool" in args
     webhook = _args("--webhook", "").strip()
     override_ids = [x.strip() for x in _args("--study-ids", "").split(",") if x.strip()] or None

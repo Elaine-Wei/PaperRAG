@@ -568,6 +568,37 @@ def generate_composite(meta, sub_scores, cross_check_on=False, model=MAIN_MODEL)
     # 日后：if cross_check_on: composite_review(luna) → composite_finalize(Claude)
 
 
+def weighted_composite(sub_scores, weights):
+    """Deterministic 0-10 composite for config-driven topic boards.
+
+    Each available dimension is scored 0-5.  Missing dimensions (currently
+    authority may be N/A) are omitted and the remaining weights are renormalized.
+    Legacy boards continue to use the LLM-based generate_composite path.
+    """
+    aliases = {"repro": "reproducibility"}
+    available = {}
+    for key, value in (sub_scores or {}).items():
+        key = aliases.get(key, key)
+        if key not in weights:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= value <= 5.0:
+            available[key] = value
+    usable_weight = sum(float(weights[key]) for key in available)
+    if not available or usable_weight <= 0:
+        return {"score": None, "reason": "没有可用的主题评分维度", "na": True}
+    score = 10.0 * sum(float(weights[key]) * (value / 5.0)
+                       for key, value in available.items()) / usable_weight
+    return {
+        "score": round(max(0.0, min(10.0, score)), 1),
+        "reason": "按主题配置权重对可用维度加权（N/A 维度已重新归一化）",
+        "na": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 归一化 / 计算
 # ---------------------------------------------------------------------------
@@ -988,7 +1019,7 @@ def generate_score(arxiv_id, cross_check_on=True, model=MAIN_MODEL,
     cross_notes = []
     if cross_check_on:
         try:
-            cm = cross_model or CROSSCHECK_MODEL   # 榜单可传 sol（luna 宕机时）；默认不变=daily 一致
+            cm = cross_model or CROSSCHECK_MODEL   # 榜单可显式传模型；默认保持 daily 一致
             print(f"[scorer] 交叉复核（{cm}）…")
             critique, _ = cross_check(meta, scores_for_llm(norm), cm)
             if critique:

@@ -1,0 +1,22 @@
+{
+  "boards": [
+    {
+      "name": "factor-A",
+      "type": "hardcoded-legacy",
+      "created_at": "2026-07-21",
+      "description": "传统因子挖掘（GP / 符号回归 / RL，方法无 LLM）"
+    },
+    {
+      "name": "factor-B",
+      "type": "hardcoded-legacy",
+      "created_at": "2026-07-21",
+      "description": "LLM 因子挖掘（方法用到大语言模型）"
+    },
+    {
+      "name": "selfevo",
+      "type": "hardcoded-legacy",
+      "created_at": "2026-07-24",
+      "description": "Agent 自进化（自进化 / 自我改进的 LLM 智能体）"
+    }
+  ]
+}

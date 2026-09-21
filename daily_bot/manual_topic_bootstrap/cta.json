@@ -1,0 +1,46 @@
+{
+  "topic": "cta",
+  "verified_anchors": [
+    {
+      "arxiv_id": "1904.04912",
+      "title": "Enhancing Time Series Momentum Strategies Using Deep Neural Networks",
+      "authors": ["Bryan Lim", "Stefan Zohren", "Stephen Roberts"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    },
+    {
+      "arxiv_id": "2105.13727",
+      "title": "Slow Momentum with Fast Reversion: A Trading Strategy Using Deep Learning and Changepoint Detection",
+      "authors": ["Kieran Wood", "Stephen Roberts", "Stefan Zohren"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    }
+  ],
+  "keyword_nets": [
+    {
+      "label": "trend-and-managed-futures",
+      "queries": [
+        "CTA",
+        "trend following",
+        "trend-following",
+        "time-series momentum",
+        "managed futures",
+        "commodity trading advisor",
+        "commodity trading",
+        "cross-asset trend",
+        "time series momentum",
+        "(ti:CTA OR ti:\"trend following\" OR abs:\"time-series momentum\" OR abs:\"managed futures\")"
+      ],
+      "coverage": "CTA、趋势跟踪、时间序列动量、管理期货、商品及跨资产策略"
+    }
+  ],
+  "copy_ready_snippet": {
+    "SEEDS": ["1904.04912", "2105.13727"],
+    "ANCHORS": [],
+    "KW": [
+      "CTA", "trend following", "trend-following", "time-series momentum", "managed futures",
+      "commodity trading advisor", "commodity trading", "cross-asset trend", "time series momentum",
+      "(ti:CTA OR ti:\"trend following\" OR abs:\"time-series momentum\" OR abs:\"managed futures\")"
+    ]
+  }
+}

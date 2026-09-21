@@ -73,26 +73,14 @@ def _date_window(today=None):
     return today - _dt.timedelta(days=DATE_WINDOW_DAYS - 1), today
 
 
-def _request(query_text, start_date, end_date):
-    params = _auth_params()
-    params.update({
-        "search": query_text,
-        "filter": (
-            f"indexed_in:arxiv,from_publication_date:{start_date.isoformat()},"
-            f"to_publication_date:{end_date.isoformat()}"
-        ),
-        "sort": "publication_date:desc",
-        "per_page": PER_PAGE,
-        "select": (
-            "id,display_name,title,abstract_inverted_index,authorships,publication_date,"
-            "ids,doi,indexed_in,locations,primary_location,best_oa_location"
-        ),
-    })
+def _request_json(params, endpoint=OPENALEX_WORKS_URL):
+    request_params = _auth_params()
+    request_params.update(params)
     headers = {"User-Agent": USER_AGENT}
     last_error = None
     for attempt in range(2):
         try:
-            url = OPENALEX_WORKS_URL + "?" + urllib.parse.urlencode(params)
+            url = endpoint + "?" + urllib.parse.urlencode(request_params)
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=30) as response:
                 status = getattr(response, "status", 200)
@@ -110,7 +98,7 @@ def _request(query_text, start_date, end_date):
                 continue
             if status >= 500:
                 raise RuntimeError(f"OpenAlex returned HTTP {status}")
-            return (payload or {}).get("results") or []
+            return payload or {}
         except urllib.error.HTTPError as exc:
             last_error = exc
             if attempt:
@@ -131,7 +119,51 @@ def _request(query_text, start_date, end_date):
             if attempt:
                 break
             time.sleep(2.0)
-    raise RuntimeError(f"OpenAlex fallback failed: {last_error}")
+    raise RuntimeError(f"OpenAlex request failed: {last_error}")
+
+
+def _request(query_text, start_date, end_date):
+    params = _auth_params()
+    params.update({
+        "search": query_text,
+        "filter": (
+            f"indexed_in:arxiv,from_publication_date:{start_date.isoformat()},"
+            f"to_publication_date:{end_date.isoformat()}"
+        ),
+        "sort": "publication_date:desc",
+        "per_page": PER_PAGE,
+        "select": (
+            "id,display_name,title,abstract_inverted_index,authorships,publication_date,"
+            "ids,doi,indexed_in,locations,primary_location,best_oa_location"
+        ),
+    })
+    return (_request_json(params).get("results") or [])
+
+
+def fetch_works_by_arxiv_ids(arxiv_ids):
+    """Batch lookup works using their canonical arXiv DOI aliases.
+
+    OpenAlex's filter syntax uses one field followed by OR-separated values;
+    it is distinct from the search-based fallback request above.
+    """
+    ids = [str(aid).strip() for aid in arxiv_ids if str(aid).strip()]
+    if not ids:
+        return {}
+    doi_values = "|".join(f"10.48550/arXiv.{aid}" for aid in ids)
+    payload = _request_json({
+        "filter": f"doi:{doi_values}",
+        "per_page": min(PER_PAGE, len(ids)),
+        "select": (
+            "id,ids,display_name,publication_year,cited_by_count,counts_by_year,"
+            "fwci,citation_normalized_percentile"
+        ),
+    })
+    out = {}
+    for work in payload.get("results") or []:
+        aid = extract_arxiv_id(work)
+        if aid:
+            out[aid] = work
+    return out
 
 
 def _extract_id_from_text(value):

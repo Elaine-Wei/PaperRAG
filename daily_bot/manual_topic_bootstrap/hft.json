@@ -1,0 +1,46 @@
+{
+  "topic": "hft",
+  "verified_anchors": [
+    {
+      "arxiv_id": "1803.06917",
+      "title": "Universal features of price formation in financial markets: perspectives from Deep Learning",
+      "authors": ["Justin Sirignano", "Rama Cont"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    },
+    {
+      "arxiv_id": "2101.07107",
+      "title": "Deep Reinforcement Learning for Active High Frequency Trading",
+      "authors": ["Antonio Briola", "Jeremy Turiel", "Riccardo Marcaccioli", "Alvaro Cauderan", "Tomaso Aste"],
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    }
+  ],
+  "keyword_nets": [
+    {
+      "label": "high-frequency-and-low-latency",
+      "queries": [
+        "high-frequency trading",
+        "high frequency trading",
+        "high-frequency",
+        "tick-level",
+        "tick data",
+        "low-latency",
+        "low latency",
+        "high-frequency execution",
+        "latency-sensitive",
+        "(ti:\"high-frequency trading\" OR ti:\"high frequency trading\" OR ti:\"tick-level\" OR abs:\"low-latency\" OR abs:\"high-frequency trading\")"
+      ],
+      "coverage": "高频交易策略、tick-level 数据、低延迟系统、高频执行与延迟敏感交易"
+    }
+  ],
+  "copy_ready_snippet": {
+    "SEEDS": ["1803.06917", "2101.07107"],
+    "ANCHORS": [],
+    "KW": [
+      "high-frequency trading", "high frequency trading", "high-frequency", "tick-level", "tick data",
+      "low-latency", "low latency", "high-frequency execution", "latency-sensitive",
+      "(ti:\"high-frequency trading\" OR ti:\"high frequency trading\" OR ti:\"tick-level\" OR abs:\"low-latency\" OR abs:\"high-frequency trading\")"
+    ]
+  }
+}

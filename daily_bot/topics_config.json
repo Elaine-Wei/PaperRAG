@@ -1,0 +1,37 @@
+{
+  "topics": {
+    "options": {
+      "label": "期权 / Options",
+      "description": "期权/波动率/衍生品交易：期权定价与对冲、隐含波动率/波动率曲面、期权组合与策略、期权市场微观结构。注意：泛化资产定价、非期权衍生品，或仅把期权作为应用场景不算。",
+      "bootstrap_json": "manual_topic_bootstrap/options.json",
+      "prefilter_terms": ["option", "options", "option pricing", "implied volatility", "volatility surface", "volatility smile", "option hedging", "option portfolio", "option strategy"],
+      "weights": {"freshness": 0.2, "reproducibility": 0.2, "novelty": 0.2, "domain_relevance": 0.2, "authority": 0.2},
+      "top_n": 10,
+      "study_top": 6,
+      "shortlist_top": 30,
+      "foundational_days": 365
+    },
+    "cta": {
+      "label": "CTA / Trend Following",
+      "description": "CTA/趋势跟踪/管理期货：商品及跨资产的趋势跟踪、时间序列动量、managed futures、CTA 策略与组合、信号生成、仓位管理、风险配置及回测。注意：泛化量化交易、单纯资产配置或非趋势型套利不算。",
+      "bootstrap_json": "manual_topic_bootstrap/cta.json",
+      "prefilter_terms": ["CTA", "trend following", "trend-following", "time-series momentum", "managed futures", "commodity trading advisor", "commodity trading", "cross-asset trend", "time series momentum"],
+      "weights": {"freshness": 0.2, "reproducibility": 0.2, "novelty": 0.2, "domain_relevance": 0.2, "authority": 0.2},
+      "top_n": 10,
+      "study_top": 6,
+      "shortlist_top": 30,
+      "foundational_days": 365
+    },
+    "hft": {
+      "label": "高频 / High-Frequency Trading",
+      "description": "高频交易/低延迟交易：高频交易策略、tick-level 数据、低延迟行情与交易系统、高频执行、交易撮合、订单流或做市中的高频行为。注意：普通量化交易、普通订单簿/做市研究、仅使用 high-frequency 时间序列，或仅用 GPU/分布式训练不算。",
+      "bootstrap_json": "manual_topic_bootstrap/hft.json",
+      "prefilter_terms": ["high-frequency trading", "high frequency trading", "high-frequency", "tick-level", "tick data", "low-latency", "low latency", "high-frequency execution", "latency-sensitive"],
+      "weights": {"freshness": 0.2, "reproducibility": 0.2, "novelty": 0.2, "domain_relevance": 0.2, "authority": 0.2},
+      "top_n": 10,
+      "study_top": 6,
+      "shortlist_top": 30,
+      "foundational_days": 365
+    }
+  }
+}
