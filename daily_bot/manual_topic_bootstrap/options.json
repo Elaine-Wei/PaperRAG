@@ -2,6 +2,25 @@
   "topic": "options",
   "verified_anchors": [
     {
+      "arxiv_id": "1802.03042",
+      "title": "Deep Hedging",
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    },
+    {
+      "arxiv_id": "1707.02568",
+      "title": "Solving high-dimensional PDEs using deep learning",
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids",
+      "review_note": "Broad high-dimensional PDE methodology; option pricing is one application. Reassess topical fit before promotion."
+    },
+    {
+      "arxiv_id": "1906.05065",
+      "title": "Deep Smoothing of the Implied Volatility Surface",
+      "category": "foundational",
+      "verification": "run_boards.fetch_ids"
+    },
+    {
       "arxiv_id": "1901.09647",
       "title": "Deep Learning Volatility",
       "authors": ["Blanka Horvath", "Aitor Muguruza", "Mehdi Tomas"],
@@ -35,7 +54,7 @@
     }
   ],
   "copy_ready_snippet": {
-    "SEEDS": ["1901.09647", "1911.05620"],
+    "SEEDS": ["1802.03042", "1707.02568", "1906.05065", "1901.09647", "1911.05620"],
     "ANCHORS": [],
     "KW": [
       "option", "options", "option pricing", "implied volatility", "volatility surface",
