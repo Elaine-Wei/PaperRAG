@@ -36,7 +36,7 @@ class RunBoardsFallbackTests(unittest.TestCase):
                           return_value=(papers, counts)) as fallback:
             result = run_boards.fetch_search("option pricing", 5)
 
-        fallback.assert_called_once_with("option pricing")
+        fallback.assert_called_once_with("option pricing", date_window_days=None)
         self.assertEqual(result[0]["arxiv_id"], "2345.6789")
         self.assertEqual(result[0]["fetch_source"], "openalex-fallback")
 

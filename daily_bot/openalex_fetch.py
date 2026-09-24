@@ -68,9 +68,13 @@ def translate_query(query):
     return " OR ".join(rendered)
 
 
-def _date_window(today=None):
+def _date_window(today=None, date_window_days=DATE_WINDOW_DAYS):
+    if date_window_days is None:
+        return None, None
+    if date_window_days <= 0:
+        raise ValueError("date_window_days must be positive or None")
     today = today or _dt.datetime.now(_dt.timezone.utc).date()
-    return today - _dt.timedelta(days=DATE_WINDOW_DAYS - 1), today
+    return today - _dt.timedelta(days=date_window_days - 1), today
 
 
 def _request_json(params, endpoint=OPENALEX_WORKS_URL):
@@ -122,14 +126,17 @@ def _request_json(params, endpoint=OPENALEX_WORKS_URL):
     raise RuntimeError(f"OpenAlex request failed: {last_error}")
 
 
-def _request(query_text, start_date, end_date):
+def _request(query_text, start_date=None, end_date=None):
     params = _auth_params()
+    filters = ["indexed_in:arxiv"]
+    if start_date is not None and end_date is not None:
+        filters.extend([
+            f"from_publication_date:{start_date.isoformat()}",
+            f"to_publication_date:{end_date.isoformat()}",
+        ])
     params.update({
         "search": query_text,
-        "filter": (
-            f"indexed_in:arxiv,from_publication_date:{start_date.isoformat()},"
-            f"to_publication_date:{end_date.isoformat()}"
-        ),
+        "filter": ",".join(filters),
         "sort": "publication_date:desc",
         "per_page": PER_PAGE,
         "select": (
@@ -246,14 +253,14 @@ def _normalize(work, arxiv_id):
     }
 
 
-def fetch_fallback(query):
-    """Return normalized papers and counters; perform one search plus at most one retry."""
+def fetch_fallback(query, date_window_days=DATE_WINDOW_DAYS):
+    """Return normalized papers; ``None`` searches the full indexed-in-arXiv history."""
     search = translate_query(query)
     counters = {"results": 0, "accepted": 0,
                 "discarded_no_arxiv_id": 0, "duplicate_arxiv_ids": 0}
     if not search:
         return [], counters
-    start_date, end_date = _date_window()
+    start_date, end_date = _date_window(date_window_days=date_window_days)
     works = _request(search, start_date, end_date)
     counters["results"] = len(works)
     accepted, seen = [], set()

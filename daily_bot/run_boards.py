@@ -148,7 +148,9 @@ def fetch_search(query, n=50):
     if data is not None:
         return run.parse_arxiv_xml(data)
     try:
-        papers, counts = openalex_fetch.fetch_fallback(query)
+        # Topic boards search the full arXiv history; the daily-ingest caller
+        # keeps the seven-day default for its recent-paper use case.
+        papers, counts = openalex_fetch.fetch_fallback(query, date_window_days=None)
         print(f"[run_boards][openalex-fallback] query={query} "
               f"results={counts['results']} accepted={counts['accepted']} "
               f"discarded_no_arxiv_id={counts['discarded_no_arxiv_id']} "
