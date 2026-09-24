@@ -133,6 +133,10 @@ font-size:.72rem;margin-left:8px;vertical-align:middle}
 border-radius:6px;padding:8px 10px;margin:6px 0;line-height:1.6}
 .ov-reason{font-size:.92rem;color:#1a1a1a;margin-top:6px}
 .ov-reason b{color:#c0392b}
+.ov-board{margin-top:30px}
+.ov-board-title{font-family:'Noto Serif SC','Libre Baskerville',serif;font-size:1.25rem;
+border-bottom:2px solid #e0ddd8;padding-bottom:8px;margin:26px 0 12px}
+.ov-board-sub{color:#777;font-size:.86rem;margin:-4px 0 12px}
 """
 
 
@@ -177,7 +181,8 @@ def _hook_for(row, meta):
     return (abs_[:90] + "…") if len(abs_) > 90 else abs_
 
 
-def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied=None):
+def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied=None,
+                      monthly_rows=None, classic_rows=None):
     """
     组装【滚动窗口榜单】概览单文件：每篇一行 = 群消息格式(format_scores) + 综评分 + 综评理由，
     按 ids_sorted（综评降序）呈现。今日新精读标 ★今日精读；此前已精读标 ✓已精读。
@@ -227,7 +232,48 @@ def assemble_overview(conn, ids_sorted, studied_ids, date_str=None, prev_studied
 
     full_css = _read(CSS_PATH)
     katex_head = katex_inline.head_block()
-    body = deep_study.strip_dollar_in_svg_text("\n".join(entries))
+    weekly_body = deep_study.strip_dollar_in_svg_text("\n".join(entries))
+
+    def board_card(rank, aid, title, published, score, meta_text, reason=""):
+        score_txt = f"{float(score):.1f}/10" if score is not None else "N/A"
+        return (f'<div class="ov-entry">'
+                f'<div class="ov-head"><span class="ov-rank">#{rank}</span>📄 '
+                f'{html.escape(title or aid)}</div>'
+                f'<div class="ov-meta">{html.escape(meta_text)} · 综评 '
+                f'<span class="ov-comp">{score_txt}</span> · '
+                f'<a href="https://arxiv.org/abs/{html.escape(aid)}">arXiv:{html.escape(aid)}</a></div>'
+                + (f'<div class="ov-reason">{html.escape(reason)}</div>' if reason else "")
+                + '</div>')
+
+    monthly_rows = list(monthly_rows or [])
+    classic_rows = list(classic_rows or [])
+    monthly_cards = []
+    for rank, item in enumerate(monthly_rows[:10], 1):
+        aid = item.get("arxiv_id")
+        meta = next((m for m in db.get_papers(conn, [aid]) if m.get("arxiv_id") == aid), {})
+        monthly_cards.append(board_card(
+            rank, aid, meta.get("title") or aid, item.get("published"), item.get("composite"),
+            f"发表 {item.get('published')} · 方向 {item.get('area') or '?'}"))
+
+    classic_cards = []
+    for rank, item in enumerate(classic_rows[:10], 1):
+        aid, title, published, score, citations, active, percentile, fwci = item
+        classic_cards.append(board_card(
+            rank, aid, title, published, score,
+            f"发表 {published} · citations {citations if citations is not None else 'N/A'} · "
+            f"活跃引用年 {active if active is not None else 'N/A'}",
+            f"Classic score v2.1 · OpenAlex percentile {percentile if percentile is not None else 'N/A'}"))
+
+    monthly_body = "".join(monthly_cards) or '<div class="ov-entry">暂无数据</div>'
+    classic_body = "".join(classic_cards) or '<div class="ov-entry">暂无数据</div>'
+    body = (f'<section class="ov-board"><h2 class="ov-board-title">🔥 本周新品榜</h2>'
+            f'<div class="ov-board-sub">最近 7 天相关论文，按综评分排序</div>{weekly_body}</section>')
+    body += (f'<section class="ov-board"><h2 class="ov-board-title">📈 本月潜力榜</h2>'
+             f'<div class="ov-board-sub">发表 8–30 天、已有综评的论文</div>'
+             f'{monthly_body}</section>')
+    body += (f'<section class="ov-board"><h2 class="ov-board-title">📚 经典沉淀榜</h2>'
+             f'<div class="ov-board-sub">OpenAlex citation impact · Classic score v2.1</div>'
+             f'{classic_body}</section>')
     doc = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">

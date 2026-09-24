@@ -13,8 +13,6 @@ import json
 import re
 import sys
 import types
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -44,30 +42,6 @@ def _load_arxiv_helpers():
 
 
 run_boards = _load_arxiv_helpers()
-
-
-def _install_review_only_arxiv_get():
-    """Keep a rate-limited review run from retrying a whole nomination set.
-
-    The existing helper remains the public fetch_ids/fetch_search API used
-    below.  Only its transport callback is replaced in this additive tool so
-    a 429 becomes an explicit unverified/preview failure in the artifact.
-    """
-    def get_once(url, tries=3):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PaperRAG-topic-bootstrap/1"})
-            with urllib.request.urlopen(req, timeout=45) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            print(f"    [arxiv] review fetch failed HTTP {exc.code}; recording as unavailable", flush=True)
-            return None
-        except Exception as exc:
-            print(f"    [arxiv] review fetch failed ({str(exc)[:80]}); recording as unavailable", flush=True)
-            return None
-    run_boards._get = get_once
-
-
-_install_review_only_arxiv_get()
 
 
 NOMINATION_SYSTEM = r'''You are a research-literature nomination assistant.
@@ -160,31 +134,48 @@ def _openalex_enrichment(arxiv_id, title):
         return {"unavailable": str(exc)[:160]}
 
 
+def _nomination_models(requested):
+    """Put the requested model first, then try each configured model once."""
+    daily_run = sys.modules.get("run")
+    configured = getattr(daily_run, "MODEL_ROTATION", None) or [
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4.1-flash"
+    ]
+    models = [requested] + list(configured)
+    return list(dict.fromkeys(str(m).strip() for m in models if str(m).strip()))
+
+
 def nominate(topic, description, model, foundational_n, recent_n, queries_per_flavor):
     user = (f"Topic name: {topic}\nTopic description: {description}\n\n"
             f"Nominate at most {foundational_n} foundational and {recent_n} recent_influential "
             f"papers. Propose at most {queries_per_flavor} queries per keyword-net flavor.")
     last_error = None
-    # One nomination call per CLI run: relay itself already rotates keys and
-    # retries transient failures.  A second full nomination would duplicate
-    # a potentially expensive LLM request and delay the review artifact.
-    for attempt in range(1):
+    attempts = []
+    # One call per model: relay already rotates keys within each call, while
+    # model fallback spreads this single nomination across backend pools.
+    for attempt, attempt_model in enumerate(_nomination_models(model), 1):
         try:
             content, usage = relay.relay_chat(NOMINATION_SYSTEM, user, temperature=0,
-                                               model=model, max_tokens=5000)
+                                               model=attempt_model, max_tokens=5000)
             obj = relay.extract_json(content)
             if isinstance(obj, dict):
                 obj.setdefault("foundational", [])
                 obj.setdefault("recent_influential", [])
                 obj.setdefault("keyword_nets", [])
                 obj["_usage"] = usage
-                obj["_attempt"] = attempt + 1
+                obj["_attempt"] = attempt
+                obj["_model"] = attempt_model
+                obj["_nomination_attempts"] = attempts + [{"attempt": attempt,
+                    "model": attempt_model, "status": "success"}]
                 return obj
             last_error = "nomination response was not valid JSON"
+            attempts.append({"attempt": attempt, "model": attempt_model,
+                             "status": "invalid_json", "error": last_error})
         except Exception as exc:  # preserve a review artifact even on model failure
             last_error = str(exc)
+            attempts.append({"attempt": attempt, "model": attempt_model,
+                             "status": "error", "error": last_error[:240]})
     return {"foundational": [], "recent_influential": [], "keyword_nets": [],
-            "_error": last_error}
+            "_error": last_error, "_nomination_attempts": attempts}
 
 
 def verify_candidate(candidate, category):
@@ -264,7 +255,9 @@ def build_report(topic, description, nomination, verified, unverified, rejected,
             "proposed_but_unverified": unverified, "rejected_or_ambiguous": rejected,
             "keyword_nets": previews, "copy_ready_snippet":
             {"SEEDS": seeds, "ANCHORS": anchors, "KW": queries},
-            "live_board_created": False, "database_written": False}
+            "live_board_created": False, "database_written": False,
+            "nomination_model": nomination.get("_model"),
+            "nomination_attempts": nomination.get("_nomination_attempts", [])}
 
 
 def render_markdown(report):

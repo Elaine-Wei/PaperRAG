@@ -1268,6 +1268,32 @@ def monthly_rising_dry_run(conn, top_n=10, min_age=8, max_age=30):
     return {"candidates": len(window), "top": window[:top_n], "dry_run": True}
 
 
+def _refresh_classic_board(conn):
+    """Refresh due OpenAlex impact rows; Classic delivery remains best-effort."""
+    try:
+        import paper_impact
+        paper_impact.ensure_schema(conn)
+        stats = paper_impact.refresh(conn)
+        print("[classic] refresh: "
+              f"corpus={stats['corpus']} due={stats['due']} "
+              f"enriched={stats['enriched']} scored={stats['scored']} "
+              f"failed={stats['failed']} version={paper_impact.CLASSIC_SCORE_VERSION}")
+        return stats
+    except Exception as exc:
+        print(f"[classic][WARN] refresh failed; using cached rows: {str(exc)[:160]}")
+        return {"failed": 1, "error": str(exc)}
+
+
+def _classic_rows(conn, limit=10):
+    """Read the cached Classic ranking without making any network calls."""
+    try:
+        import paper_impact
+        return paper_impact.classic_top(conn, limit=limit)
+    except Exception as exc:
+        print(f"[classic][WARN] read failed; section will be empty: {str(exc)[:160]}")
+        return []
+
+
 def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False,
               model_rotation=None, score_only=False, study_only=False):
     """
@@ -1324,6 +1350,11 @@ def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False,
                           if sc and sc.get("composite_score") is not None else None)
         ranked = sorted(ids, key=lambda a: (comps[a] is not None, comps[a] or 0.0), reverse=True)
 
+        # Classic refresh is deliberately outside the LLM scoring loop. It is
+        # due/cached OpenAlex enrichment and therefore belongs to the night
+        # score phase; study-only only reads the resulting cache.
+        _refresh_classic_board(conn)
+
         if score_only:
             run_id = f"top30-score-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
             db.create_top30_run(conn, run_id, "score", window_days, study_top)
@@ -1355,8 +1386,12 @@ def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False,
     # 5) 概览
     date_str = datetime.date.today().isoformat()
     conn = db.ensure(conn)
+    monthly_rows = db.get_monthly_rising_batch(conn, min_age=8, max_age=30)
+    classic_rows = _classic_rows(conn, limit=10)
     overview = assemble.assemble_overview(conn, ranked, studied, date_str,
-                                          prev_studied=prev_studied)
+                                          prev_studied=prev_studied,
+                                          monthly_rows=monthly_rows,
+                                          classic_rows=classic_rows)
     print(f"\n[top30] 概览：{overview}")
 
     # 6) 交付：上传 COS（强制下载）+ 一条 markdown 链接消息（webhook 空 → 两者都跳过）
@@ -1385,7 +1420,9 @@ def run_top30(conn, fetch_n=30, study_top=6, window_days=7, dry_run=False,
     except Exception as e:
         print(f"[top30][cos][WARN] 概览上传失败：{e}")
         pushed["failed"] += 1
-    lead.append(f"综评前 {len(studied)} 篇 · 深度精读（在线预览，或下载 HTML 永久保存）：")
+    lead.append(f"🔥 本周新品榜：综评前 {len(ranked)} 篇；其中 {len(studied)} 篇已完成深度精读")
+    lead.append(f"📈 本月潜力榜：{len(monthly_rows)} 篇（8–30 天、读取已有综评）")
+    lead.append(f"📚 经典沉淀榜：{len(classic_rows)} 篇（OpenAlex Classic score v2.1）")
 
     # 每篇：英文标题 → 中文简介 → 两链接（预览/下载）
     item_blocks = []

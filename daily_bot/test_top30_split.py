@@ -49,6 +49,9 @@ class FakeDB:
     def get_stage_status(self, conn, aid):
         return {"studied": False}
 
+    def get_monthly_rising_batch(self, conn, min_age, max_age):
+        return []
+
 
 class Top30SplitTests(unittest.TestCase):
     def test_score_only_persists_manifest_and_does_not_study(self):
@@ -56,6 +59,7 @@ class Top30SplitTests(unittest.TestCase):
         with patch.object(run, "db", db), \
              patch.object(run, "_ensure_score", side_effect=lambda c, a: (c, True)), \
              patch.object(run, "_ensure_composite", side_effect=lambda c, a: (c, True)), \
+             patch.object(run, "_refresh_classic_board"), \
              patch.object(run, "run_study_with_backoff") as study:
             result = run.run_top30(object(), window_days=7, study_top=2,
                                     score_only=True)
@@ -72,6 +76,7 @@ class Top30SplitTests(unittest.TestCase):
         with patch.object(run, "db", db), \
              patch.object(run, "run_study_with_backoff",
                           return_value={"completed": [], "gave_up": [], "log_path": "x"}) as study, \
+             patch.object(run, "_classic_rows", return_value=[]), \
              patch.dict(sys.modules, {"assemble": fake_assemble, "wecom": fake_wecom}):
             result = run.run_top30(object(), window_days=7, study_top=1,
                                     study_only=True)
