@@ -19,6 +19,23 @@ class OpenAlexFallbackWindowTests(unittest.TestCase):
         self.assertIsInstance(end, dt.date)
         self.assertEqual((end - start).days, 6)
 
+    def test_prefixed_daily_query_translation_is_unchanged(self):
+        self.assertEqual(
+            openalex_fetch.translate_query('ti:"option pricing" abs:hedging'),
+            '"option pricing" OR hedging',
+        )
+
+    def test_bare_quoted_title_becomes_search_term(self):
+        query = '"Retail Trading in Options and the Rise of the Big Three Wholesalers" AuthorSurname'
+        self.assertEqual(
+            openalex_fetch.translate_query(query),
+            '"Retail Trading in Options and the Rise of the Big Three Wholesalers AuthorSurname"',
+        )
+        with patch.object(openalex_fetch, "_request", return_value=[]) as request:
+            openalex_fetch.fetch_fallback(query, date_window_days=None)
+        self.assertEqual(request.call_args.args[0],
+                         '"Retail Trading in Options and the Rise of the Big Three Wholesalers AuthorSurname"')
+
     def test_run_daily_ingest_keeps_original_call_signature(self):
         error = RuntimeError("simulated arXiv failure")
         counts = {"results": 0, "accepted": 0,

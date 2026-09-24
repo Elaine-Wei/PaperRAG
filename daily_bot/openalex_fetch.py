@@ -55,7 +55,14 @@ def _fallback_terms(query):
         return ["distributed computing", "parallel computing", "performance", "low latency"]
     if "math.oc" in q:
         return ["optimization", "operations research", "optimal control"]
-    return []
+    # Topic-board callers may provide a bare quoted paper title, optionally
+    # followed by an author surname, rather than arXiv ti:/abs: syntax.
+    literal = (query or "").strip()
+    if literal.startswith('"'):
+        closing = literal.find('"', 1)
+        if closing > 0:
+            literal = (literal[1:closing] + literal[closing + 1:]).strip()
+    return [literal] if literal else []
 
 
 def translate_query(query):
