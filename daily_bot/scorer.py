@@ -27,7 +27,8 @@ import os
 import re
 import sys
 import urllib.parse
-import urllib.request
+
+import requests
 
 import run      # 导入即加载 daily_bot/.env，并提供 arXiv XML 解析
 import relay
@@ -35,8 +36,12 @@ import affiliation
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(HERE, "output")
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
-UA = {"User-Agent": "PaperRAG-scorer/0 (mailto:elaine.wei@xpef.org)"}
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+UA = {
+    "User-Agent": "PaperRAG/1.0 (mailto:elaine.wei@xpef.org)",
+    "Accept": "application/atom+xml",
+}
+PDF_HEADERS = {"User-Agent": UA["User-Agent"]}
 
 MAIN_MODEL = "gpt-5.6-sol"         # 主评分
 CROSSCHECK_MODEL = "gpt-5.6-luna"   # 交叉复核（用不同家族的模型做异构复核）
@@ -108,8 +113,9 @@ PALETTE = ["#c0392b", "#16786a", "#2c5aa0", "#b8860b", "#7d5ba6", "#777777"]
 def fetch_metadata(arxiv_id):
     url = ARXIV_API_URL + "?" + urllib.parse.urlencode(
         {"id_list": arxiv_id, "max_results": 1})
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
-        data = r.read()
+    response = requests.get(url, headers=UA, timeout=30)
+    response.raise_for_status()
+    data = response.content
     papers = run.parse_arxiv_xml(data)
     return papers[0] if papers else None
 
@@ -118,9 +124,9 @@ def fetch_fulltext(meta):
     """下载 PDF 抽全文（供复现性/新颖度判断）。失败则退回摘要。"""
     pdf_url = meta.get("pdf_url") or f"https://arxiv.org/pdf/{meta.get('arxiv_id')}"
     try:
-        with urllib.request.urlopen(urllib.request.Request(pdf_url, headers=UA),
-                                    timeout=120) as r:
-            pdf_bytes = r.read()
+        response = requests.get(pdf_url, headers=PDF_HEADERS, timeout=120)
+        response.raise_for_status()
+        pdf_bytes = response.content
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         text = "\n".join(p.get_text() for p in doc)
