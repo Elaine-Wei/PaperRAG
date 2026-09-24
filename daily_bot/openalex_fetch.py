@@ -154,7 +154,8 @@ def fetch_works_by_arxiv_ids(arxiv_ids):
         "filter": f"doi:{doi_values}",
         "per_page": min(PER_PAGE, len(ids)),
         "select": (
-            "id,ids,display_name,publication_year,cited_by_count,counts_by_year,"
+            "id,ids,display_name,publication_date,publication_year,authorships,"
+            "abstract_inverted_index,cited_by_count,counts_by_year,"
             "fwci,citation_normalized_percentile"
         ),
     })

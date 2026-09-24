@@ -29,6 +29,7 @@ import run          # noqa: E402  加载 .env + parse_arxiv_xml + 复用 _classi
 import db           # noqa: E402
 import scorer       # noqa: E402
 import deep_study   # noqa: E402
+import openalex_fetch  # noqa: E402  arXiv retrieval fallback only
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_HEADERS = {
@@ -79,12 +80,63 @@ def _get(url, tries=3):
     return None
 
 
+def _normalize_openalex_work(work, arxiv_id):
+    """Map an OpenAlex work into the metadata shape returned by arXiv XML."""
+    authors = []
+    for authorship in work.get("authorships") or []:
+        author = authorship.get("author") if isinstance(authorship, dict) else None
+        name = author.get("display_name") if isinstance(author, dict) else None
+        if name:
+            authors.append(name)
+    abstract = ""
+    inverted = work.get("abstract_inverted_index")
+    if isinstance(inverted, dict):
+        positions = {}
+        for word, indexes in inverted.items():
+            for index in indexes if isinstance(indexes, list) else []:
+                try:
+                    positions[int(index)] = word
+                except (TypeError, ValueError):
+                    continue
+        abstract = " ".join(positions[i] for i in sorted(positions))
+    published = work.get("publication_date") or ""
+    if not published and work.get("publication_year"):
+        published = f"{work['publication_year']}-01-01"
+    return {
+        "arxiv_id": arxiv_id,
+        "title": work.get("display_name") or work.get("title") or "",
+        "abstract": abstract,
+        "authors": authors,
+        "categories": [],
+        "published": published,
+        "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+        "arxiv_comment": None,
+        "journal_ref": None,
+        "fetch_source": "openalex-fallback",
+    }
+
+
+def _openalex_id_fallback(ids):
+    works = openalex_fetch.fetch_works_by_arxiv_ids(ids)
+    normalized = {}
+    for requested in ids:
+        aid = str(requested).strip().split("v", 1)[0]
+        work = works.get(requested) or works.get(aid)
+        if work:
+            normalized[aid] = _normalize_openalex_work(work, aid)
+    print(f"[run_boards][openalex-fallback] id_lookup requested={len(ids)} "
+          f"matched={len(normalized)}", flush=True)
+    return normalized
+
+
 def fetch_ids(ids):
     if not ids:
         return {}
     data = _get(ARXIV_API + "?" + urllib.parse.urlencode(
         {"id_list": ",".join(ids), "max_results": len(ids)}))
-    return {p["arxiv_id"]: p for p in run.parse_arxiv_xml(data)} if data else {}
+    if data is not None:
+        return {p["arxiv_id"]: p for p in run.parse_arxiv_xml(data)}
+    return _openalex_id_fallback(ids)
 
 
 def fetch_search(query, n=50):
@@ -93,7 +145,18 @@ def fetch_search(query, n=50):
         {"search_query": f"all:{query}", "start": 0, "max_results": n,
          "sortBy": "relevance", "sortOrder": "descending"}))
     time.sleep(1.0)  # 尊重 arXiv 限速
-    return run.parse_arxiv_xml(data) if data else []
+    if data is not None:
+        return run.parse_arxiv_xml(data)
+    try:
+        papers, counts = openalex_fetch.fetch_fallback(query)
+        print(f"[run_boards][openalex-fallback] query={query} "
+              f"results={counts['results']} accepted={counts['accepted']} "
+              f"discarded_no_arxiv_id={counts['discarded_no_arxiv_id']} "
+              f"duplicate_arxiv_ids={counts['duplicate_arxiv_ids']}", flush=True)
+        return papers[:n]
+    except Exception as exc:
+        print(f"[run_boards][openalex-fallback] query={query} failed: {exc}", flush=True)
+        return []
 
 
 # 便宜预筛：先扔掉明显非金融（省 LLM 调用）——q-fin 分类，或标题/摘要含金融词。
